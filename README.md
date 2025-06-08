@@ -97,10 +97,9 @@ python3 batch_embedder.py
 python3 data_formatter.py
 ```
 
-> If you run into issues, tweak self.quality_score_threshold. Higher less examples but higher quality.
-> 
 > Cleans, deduplicates, and formats Q&A pairs into `data_finetune/`
-
+> 
+> If you run into issues, tweak self.quality_score_threshold. Higher less examples but higher quality.
 ---
 
 ### 5. Train the Model (LoRA)
