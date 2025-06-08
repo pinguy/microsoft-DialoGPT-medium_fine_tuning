@@ -6,12 +6,13 @@ A modular pipeline for preparing, embedding, indexing, and fine-tuning dialogue 
 
 ## 📦 Prerequisites
 
-**Platform:** Linux (tested in Distrobox)  
-**Minimum Specs:** CPU with 8 threads cores, 24GB RAM for the training but can lower the batch size:
-per_device_train_batch_size
-gradient_accumulation_steps
-**Recommended:** No GPU and will run on a potato with a few values changed.
+**Platform:** Linux (tested in Distrobox)
+**Minimum Specs:** CPU with 8 threads and 24 GB RAM for training. You can reduce memory usage by adjusting:
 
+* `per_device_train_batch_size`
+* `gradient_accumulation_steps`
+
+**Recommended:** No GPU required. With a few value tweaks, it’ll even run on a potato.
 ---
 
 ## 🔧 Environment Setup
