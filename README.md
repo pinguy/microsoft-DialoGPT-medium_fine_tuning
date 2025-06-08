@@ -8,7 +8,7 @@ A modular pipeline for preparing, embedding, indexing, and fine-tuning dialogue 
 
 **Platform:** Linux (tested in Distrobox)
 
-**Minimum Specs:** CPU with 8 threads and 24 GB RAM for training. You can reduce memory usage (lower uses less RAM) by adjusting:
+**Minimum Specs:** CPU with 8 threads and 24 GB RAM for training. You can reduce memory usage (lower uses less RAM) by adjusting these values in `train.py`:
 
 * `per_device_train_batch_size`
 * `gradient_accumulation_steps`
