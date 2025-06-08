@@ -8,12 +8,12 @@ A modular pipeline for preparing, embedding, indexing, and fine-tuning dialogue 
 
 **Platform:** Linux (tested in Distrobox)
 
-**Minimum Specs:** CPU with 8 threads and 24 GB RAM for training. You can reduce memory usage (lower uses less RAM) by adjusting these values in `train.py`:
+**Minimum Specs:** CPU with 8 threads and 24 GB RAM for training. You can reduce memory usage by adjusting the following values in `train.py`:
 
 * `per_device_train_batch_size`
 * `gradient_accumulation_steps`
 
-**Recommended:** No GPU required. With a few value tweaks, it’ll even run on a potato.
+**Recommended:** No GPU required. With a few tweaks, it’ll even run on a potato.
 
 ---
 
@@ -97,9 +97,11 @@ python3 batch_embedder.py
 python3 data_formatter.py
 ```
 
-> Cleans, deduplicates, and formats Q&A pairs into `data_finetune/`
+> Cleans, deduplicates, and formats Q\&A pairs into `data_finetune/`.
 > 
-> If you run into issues, tweak self.quality_score_threshold. Higher less examples but higher quality.
+> If you run into issues, tweak `self.quality_score_threshold`.
+> Higher values give fewer examples but better quality.
+
 ---
 
 ### 5. Train the Model (LoRA)
