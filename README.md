@@ -1,4 +1,4 @@
-# Rhizome: Fine-Tuning Pipeline for Memory-Infused Dialogic AI
+# Fine-Tuning Pipeline for Memory-Infused Dialogic AI
 
 A modular pipeline for preparing, embedding, indexing, and fine-tuning dialogue data using LoRA and FAISS-backed memory on resource-constrained systems.
 
