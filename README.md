@@ -143,3 +143,10 @@ python3 chat.py
 - Works best with well-curated, conversational datasets
 - Memory-backed recall enables enhanced introspective evaluation
 - Logs and training diagnostics are saved automatically
+
+---
+
+## 📄 License
+
+This project is licensed under the WTFPL – *Do What the Fuck You Want to Public License*.  
+See [wtfpl.net](http://www.wtfpl.net/) for more.
