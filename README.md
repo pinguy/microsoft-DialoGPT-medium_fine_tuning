@@ -7,12 +7,14 @@ A modular pipeline for preparing, embedding, indexing, and fine-tuning dialogue 
 ## 📦 Prerequisites
 
 **Platform:** Linux (tested in Distrobox)
-**Minimum Specs:** CPU with 8 threads and 24 GB RAM for training. You can reduce memory usage by adjusting:
+
+**Minimum Specs:** CPU with 8 threads and 24 GB RAM for training. You can reduce memory usage by adjusting (lower uses less RAM):
 
 * `per_device_train_batch_size`
 * `gradient_accumulation_steps`
 
 **Recommended:** No GPU required. With a few value tweaks, it’ll even run on a potato.
+
 ---
 
 ## 🔧 Environment Setup
@@ -38,7 +40,7 @@ python3 -m spacy download en_core_web_sm
 
 ```
 AI_Fine_Tuning_Pipeline/
-├── PDFs/                    # Raw PDFs to be parsed into text
+├── PDFs/                   # Raw PDFs to be parsed into text
 ├── data_finetune/          # Clean Q&A dataset generated for fine-tuning
 ├── dialogpt-finetuned/     # Checkpoint outputs from training
 ├── conversations.json      # Your exported conversation history
@@ -93,9 +95,10 @@ python3 batch_embedder.py
 
 ```bash
 python3 data_formatter.py
-If you have issues with this change self.quality_score_threshold
 ```
 
+> If you run into issues, tweak self.quality_score_threshold. Higher less examples but higher quality.
+> 
 > Cleans, deduplicates, and formats Q&A pairs into `data_finetune/`
 
 ---
@@ -151,5 +154,7 @@ python3 chat.py
 
 ## 📄 License
 
-This project is licensed under the WTFPL – *Do What the Fuck You Want to Public License*.  
+This project is licensed under the WTFPL – *Do What the Fuck You Want to Public License*.
 See [wtfpl.net](http://www.wtfpl.net/) for more.
+
+---
