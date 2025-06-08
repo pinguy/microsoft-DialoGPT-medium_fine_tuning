@@ -90,6 +90,7 @@ python3 batch_embedder.py
 
 ```bash
 python3 data_formatter.py
+If you have issues with this change self.quality_score_threshold
 ```
 
 > Cleans, deduplicates, and formats Q&A pairs into `data_finetune/`
