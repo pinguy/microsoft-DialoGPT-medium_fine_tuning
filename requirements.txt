@@ -1,33 +1,21 @@
-diff --git a//dev/null b/requirements.txt
-index 0000000000000000000000000000000000000000..5026777a2540749edb94b29b4acb2fe8c336ffd3 100644
---- a//dev/null
-+++ b/requirements.txt
-@@ -0,0 +1,28 @@
-+# Core libraries for training and inference
-+torch
-+transformers
-+datasets
-+peft
-+sentence-transformers
-+
-+# Utility libraries
-+numpy
-+scikit-learn
-+matplotlib
-+psutil
-+tqdm
-+pyyaml
-+ftfy
-+
-+# PDF processing
-+pdfminer.six
-+PyMuPDF
-+
-+# Memory and embeddings
-+faiss-cpu
-+
-+# Optional interactive/monitoring tools
-+wandb
-+spacy
-+gradio
-+requests
+# Utility libraries
+numpy
+scikit-learn
+matplotlib
+psutil
+tqdm
+pyyaml
+ftfy
+
+# PDF processing
+pdfminer.six
+PyMuPDF
+
+# Memory and embeddings
+faiss-cpu
+
+# Optional interactive/monitoring tools
+wandb
+spacy
+gradio
+requests
