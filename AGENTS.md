@@ -1,4 +1,4 @@
-# Fine-Tuning Pipeline for Memory-Infused Dialogic AI
+# Rhizome: Fine-Tuning Pipeline for Memory-Infused Dialogic AI
 
 A modular pipeline for preparing, embedding, indexing, and fine-tuning dialogue data using LoRA and FAISS-backed memory on resource-constrained systems.
 
@@ -41,16 +41,16 @@ python3 -m spacy download en_core_web_sm
 ```
 AI_Fine_Tuning_Pipeline/
 ├── PDFs/                   # Raw PDFs to be parsed into text
-├── data_finetune/          # Clean Q&A dataset generated for fine-tuning
-├── dialogpt-finetuned/     # Checkpoint outputs from training
+├── data_finetune/          # Clean Q&A dataset generated for fine-tuning. Created once `data_formatter.py` is ran
+├── dialogpt-finetuned/     # Checkpoint outputs from training. Created once `train.py` is ran 
 ├── conversations.json      # Your exported conversation history. The one here is just a placeholder
 ├── batch_embedder.py
 ├── chat.py
 ├── data_formatter.py
-├── embedding_config.json
-├── memory.index
-├── memory_texts.npy
-├── memory_metadata.pkl
+├── embedding_config.json   # Created once `batch_embedder.py` is ran 
+├── memory.index            # Created once `batch_embedder.py` is ran 
+├── memory_texts.npy        # Created once `batch_embedder.py` is ran 
+├── memory_metadata.pkl     # Created once `batch_embedder.py` is ran 
 ├── pdf_to_json.py
 ├── rhizome.py
 ├── train.py
