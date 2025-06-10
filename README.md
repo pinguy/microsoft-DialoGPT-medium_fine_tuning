@@ -43,7 +43,7 @@ AI_Fine_Tuning_Pipeline/
 ├── PDFs/                   # Raw PDFs to be parsed into text
 ├── data_finetune/          # Clean Q&A dataset generated for fine-tuning
 ├── dialogpt-finetuned/     # Checkpoint outputs from training
-├── conversations.json      # Your exported conversation history
+├── conversations.json      # Your exported conversation history. The one here is just a placeholder
 ├── batch_embedder.py
 ├── chat.py
 ├── data_formatter.py
