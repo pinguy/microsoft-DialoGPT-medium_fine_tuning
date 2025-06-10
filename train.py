@@ -424,7 +424,7 @@ class DialoGPTTrainer:
             lora_config = LoraConfig(
                 r=8,
                 lora_alpha=16,
-                target_modules=["c_attn"],
+                target_modules=["c_attn", "c_proj"],
                 lora_dropout=0.05,
                 bias="none",
                 task_type=TaskType.CAUSAL_LM,
