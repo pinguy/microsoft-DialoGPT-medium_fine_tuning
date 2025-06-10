@@ -53,7 +53,7 @@ AI_Fine_Tuning_Pipeline/
 ├── memory_metadata.pkl
 ├── pdf_to_json.py
 ├── rhizome.py
-├── train_dialogpt.py
+├── train.py
 ├── README.md
 ```
 
@@ -107,7 +107,7 @@ python3 data_formatter.py
 ### 5. Train the Model (LoRA)
 
 ```bash
-python3 train_dialogpt.py
+python3 train.py
 ```
 
 > LoRA fine-tuning on DialoGPT. Outputs go into `dialogpt-finetuned/`.
