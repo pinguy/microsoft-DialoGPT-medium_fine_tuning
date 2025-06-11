@@ -13,6 +13,10 @@ psutil
 tqdm
 pyyaml
 ftfy
+librosa 
+scipy
+soundfile
+kokoro
 
 # PDF processing
 pdfminer.six
