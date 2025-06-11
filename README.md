@@ -27,10 +27,10 @@ distrobox enter rhizome-dev
 Install dependencies:
 
 ```bash
-pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-pip3 install ftfy spacy wandb pdfminer.six
-pip3 install faiss-cpu
-pip3 install peft transformers datasets intel_extension_for_pytorch
+# Install packages
+pip3 install -r requirements.txt
+
+# Download spacy English model
 python3 -m spacy download en_core_web_sm
 ```
 
