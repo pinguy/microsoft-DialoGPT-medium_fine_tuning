@@ -17,6 +17,7 @@ librosa
 scipy
 soundfile
 kokoro
+vosk
 
 # PDF processing
 pdfminer.six
