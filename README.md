@@ -43,7 +43,8 @@ AI_Fine_Tuning_Pipeline/
 ├── PDFs/                   # Raw PDFs to be parsed into text
 ├── data_finetune/          # Clean Q&A dataset generated for fine-tuning. Created once `data_formatter.py` is ran
 ├── dialogpt-finetuned/     # Checkpoint outputs from training. Created once `train.py` is ran 
-├── conversations.json      # Your exported conversation history. The one here is just a placeholder
+├── conversations.json      # Your exported conversation history from ChatGPT
+├── conversations2.json      # Your exported conversation history from Claude
 ├── batch_embedder.py
 ├── chat.py
 ├── data_formatter.py
@@ -73,7 +74,7 @@ python3 pdf_to_json.py
 
 ### 2. Add Chat History
 
-Rename your largest `conversations.json` export from ChatGPT (or other AI logs) and place it in the root folder.
+Rename your largest `conversations.json` export from ChatGPT (or other AI logs) and place it in the root folder. If using more the two `conversations.json`. For ChatGPT keep it called `conversations.json` but if also using the chats from Claude name those `conversations2.json`.
 
 ---
 
