@@ -87,7 +87,7 @@ class ImprovedBatchEmbedder:
             self.device = "cuda"
             if self.model:
                 self.model = self.model.to(self.device)
-            logger.info(f"🚀 Using GPU: {torch.cuda.get_device_name(0)}") # Get name of current GPU
+            logger.info(f"🚀 Using GPU: {torch.cuda.get_device_name(0)}")
         else:
             self.device = "cpu"
             logger.info("🔧 Using CPU for embeddings")
@@ -102,7 +102,7 @@ class ImprovedBatchEmbedder:
                 texts,
                 batch_size=self.config.batch_size,
                 normalize_embeddings=True,
-                show_progress_bar=False # Progress bar handled externally by tqdm
+                show_progress_bar=False
             )
             return embeddings
         except Exception as e:
@@ -115,14 +115,14 @@ class ImprovedBatchEmbedder:
             return self._embed_batch(texts)
         
         if self.config.parallel_workers is None:
-            num_workers = min(os.cpu_count(), 4) # Cap at 4 to avoid excessive memory/context switching
+            num_workers = min(os.cpu_count(), 4)
         else:
             num_workers = self.config.parallel_workers
             
-        if len(texts) < num_workers * 2: # Don't parallelize if batch is too small
+        if len(texts) < num_workers * 2:
             return self._embed_batch(texts)
         
-        chunk_size = max(1, len(texts) // num_workers) # Ensure chunk_size is at least 1
+        chunk_size = max(1, len(texts) // num_workers)
         text_chunks = [texts[i:i + chunk_size] for i in range(0, len(texts), chunk_size)]
         
         embeddings = []
@@ -242,31 +242,29 @@ class ImprovedBatchEmbedder:
             texts_to_embed = unique_texts
             metadata_for_embed = unique_metadata
 
-        if not texts_to_embed: # All unique items were already present
+        if not texts_to_embed:
             return 0
 
-        # Use parallel embedding if enabled and not using GPU
         if self.config.enable_parallel_processing and not self.config.use_gpu:
             embeddings = self._embed_batch_parallel(texts_to_embed)
         else:
             embeddings = self._embed_batch(texts_to_embed)
         
         for i, emb in enumerate(embeddings):
-            if emb is not None and not np.all(emb == 0): # Check for None and zero vectors
+            if emb is not None and not np.all(emb == 0):
                 self.memory_texts.append(texts_to_embed[i])
                 self.memory_vectors.append(emb)
                 self.memory_metadata.append(metadata_for_embed[i])
         
-        added_count = len(embeddings) # Count all items attempted to embed
+        added_count = len(embeddings)
         self.total_embedded += added_count
         
         return added_count
     
     def stream_conversations(self, path: str, strict_mode: bool = False) -> Generator[Dict[str, Any], None, None]:
         """
-        Stream conversation messages from a JSON file with improved parsing.
-        Supports both ChatGPT export format ('mapping') and simpler 'messages' array.
-        If strict_mode is True, raises ValueError on schema mismatch.
+        Enhanced conversation streaming with better Claude chat format support.
+        Handles various conversation formats including Claude chat exports.
         """
         if not os.path.exists(path):
             logger.warning(f"Conversations file not found: {path}")
@@ -278,144 +276,220 @@ class ImprovedBatchEmbedder:
             
             logger.debug(f"Conversations data type: {type(data)}")
             
+            # Handle different conversation formats
             conversations = []
+            
             if isinstance(data, list):
+                # Direct list of conversations or messages
                 conversations = data
             elif isinstance(data, dict):
-                if "mapping" in data: # Single conversation in ChatGPT format
+                # Check for various dictionary formats
+                if "conversations" in data:
+                    # Format: {"conversations": [...]}
+                    conversations = data["conversations"]
+                elif "mapping" in data:
+                    # Single ChatGPT conversation
                     conversations = [data]
-                elif any(isinstance(v, dict) and ("mapping" in v or "messages" in v) for v in data.values()):
+                elif "messages" in data:
+                    # Single conversation with messages array
+                    conversations = [data]
+                elif all(isinstance(v, dict) for v in data.values()):
+                    # Dictionary of conversations (keyed by ID)
                     conversations = list(data.values())
+                elif all(isinstance(v, list) for v in data.values()):
+                    # Dictionary where values are lists of messages
+                    for conv_id, messages in data.items():
+                        conversations.append({"messages": messages, "id": conv_id})
                 else:
-                    if strict_mode:
-                        raise ValueError(f"Unknown conversation JSON structure at root: {list(data.keys())}")
-                    logger.warning("Unknown conversation JSON structure, attempting to parse as list of top-level messages.")
-                    if "messages" in data and isinstance(data["messages"], list):
-                        conversations = [{"messages": data["messages"]}]
-                    else:
-                        logger.error("Could not find standard conversation structure.")
-                        return
-            else:
-                if strict_mode:
-                    raise ValueError(f"Unexpected root data type for conversations: {type(data)}")
-                logger.error(f"Unexpected root data type for conversations: {type(data)}. Skipping.")
-                return
+                    # Try to treat as single conversation
+                    conversations = [data]
             
             for convo_idx, convo in enumerate(conversations):
                 if not isinstance(convo, dict):
-                    logger.debug(f"Skipping non-dict conversation entry at index {convo_idx}")
                     if strict_mode:
                         raise ValueError(f"Conversation entry at index {convo_idx} is not a dictionary.")
+                    logger.debug(f"Skipping non-dict conversation entry at index {convo_idx}")
                     continue
                 
+                # Handle ChatGPT mapping format
                 if "mapping" in convo:
-                    mapping = convo["mapping"]
-                    for msg_id, msg_data in mapping.items():
-                        try:
-                            if not isinstance(msg_data, dict):
-                                if strict_mode:
-                                    raise ValueError(f"Message data for ID {msg_id} is not a dictionary.")
-                                logger.debug(f"Skipping non-dict message data for ID {msg_id}")
-                                continue
-                                
-                            message = msg_data.get("message")
-                            if not message or not isinstance(message, dict):
-                                if strict_mode:
-                                    raise ValueError(f"Message for ID {msg_id} is missing or not a dictionary.")
-                                logger.debug(f"Skipping malformed message for ID {msg_id}")
-                                continue
-                                
-                            content = message.get("content")
-                            if not content:
-                                continue
-                                
-                            text_content = None
-                            if isinstance(content, str):
-                                text_content = content
-                            elif isinstance(content, dict):
-                                parts = content.get("parts", [])
-                                if parts and isinstance(parts, list) and parts[0] and isinstance(parts[0], str):
-                                    text_content = parts[0]
+                    self._process_mapping_format(convo, convo_idx, strict_mode)
+                
+                # Handle messages array format
+                elif "messages" in convo:
+                    messages = convo["messages"]
+                    if isinstance(messages, list):
+                        for msg_idx, msg in enumerate(messages):
+                            try:
+                                if isinstance(msg, dict):
+                                    # Handle different message structures
+                                    content = self._extract_message_content(msg)
+                                    if content:
+                                        author = self._extract_author(msg)
+                                        timestamp = msg.get("timestamp") or msg.get("created_at") or msg.get("time")
+                                        
+                                        yield {
+                                            'text': content,
+                                            'metadata': {
+                                                'source': 'conversation',
+                                                'conversation_id': convo_idx,
+                                                'message_id': msg_idx,
+                                                'author': author,
+                                                'timestamp': timestamp
+                                            }
+                                        }
                                 elif strict_mode:
-                                    raise ValueError(f"Content for ID {msg_id} is a dict but 'parts' is malformed.")
-                            elif isinstance(content, list) and content:
-                                if content[0] and isinstance(content[0], str):
-                                    text_content = content[0]
-                                elif strict_mode:
-                                    raise ValueError(f"Content for ID {msg_id} is a list but first item is not a string.")
-                            
-                            if text_content and text_content.strip():
-                                author_info = message.get("author", {})
-                                author = "unknown"
-                                if isinstance(author_info, dict):
-                                    author = author_info.get("role", "unknown")
-                                elif isinstance(author_info, str):
-                                    author = author_info
+                                    raise ValueError(f"Message at index {msg_idx} is not a dictionary.")
+                            except Exception as e:
+                                if strict_mode:
+                                    raise ValueError(f"Error processing message at index {msg_idx}: {e}") from e
+                                logger.debug(f"Skipping message at index {msg_idx}: {e}")
+                    else:
+                        if strict_mode:
+                            raise ValueError(f"'messages' in conversation {convo_idx} is not a list.")
+                        logger.debug(f"'messages' in conversation {convo_idx} is not a list, skipping")
+                
+                # Handle Claude chat format (array of turn objects)
+                elif isinstance(convo, list):
+                    for turn_idx, turn in enumerate(convo):
+                        if isinstance(turn, dict):
+                            content = self._extract_message_content(turn)
+                            if content:
+                                author = self._extract_author(turn)
+                                timestamp = turn.get("timestamp") or turn.get("created_at")
                                 
                                 yield {
-                                    'text': text_content.strip(),
+                                    'text': content,
                                     'metadata': {
                                         'source': 'conversation',
                                         'conversation_id': convo_idx,
-                                        'message_id': msg_id,
+                                        'message_id': turn_idx,
                                         'author': author,
-                                        'timestamp': message.get("create_time", None)
+                                        'timestamp': timestamp
                                     }
                                 }
-                                
-                        except Exception as e:
-                            if strict_mode:
-                                raise ValueError(f"Error processing message ID {msg_id} in strict mode: {e}") from e
-                            logger.debug(f"Skipping malformed message {msg_id}: {e}")
-                            continue
                 
-                elif "messages" in convo:
-                    for msg_idx, msg in enumerate(convo["messages"]):
-                        try:
-                            if isinstance(msg, dict) and "content" in msg:
-                                content = msg["content"]
-                                if isinstance(content, str) and content.strip():
-                                    yield {
-                                        'text': content.strip(),
-                                        'metadata': {
-                                            'source': 'conversation',
-                                            'conversation_id': convo_idx,
-                                            'message_id': msg_idx,
-                                            'author': msg.get("role", "unknown"),
-                                            'timestamp': msg.get("timestamp", None)
-                                        }
-                                    }
-                                elif strict_mode:
-                                    raise ValueError(f"Message content at index {msg_idx} is not a string or empty.")
-                            elif strict_mode:
-                                raise ValueError(f"Message at index {msg_idx} is not a dictionary or missing 'content'.")
-                        except Exception as e:
-                            if strict_mode:
-                                raise ValueError(f"Error processing message at index {msg_idx} in strict mode: {e}") from e
-                            logger.debug(f"Skipping message at index {msg_idx}: {e}")
-                            continue
+                # Handle direct message format (single message object)
                 else:
-                    if strict_mode:
-                        raise ValueError(f"Conversation at index {convo_idx} lacks 'mapping' or 'messages' key.")
-                    logger.warning(f"Conversation at index {convo_idx} has unknown structure. Skipping.")
+                    content = self._extract_message_content(convo)
+                    if content:
+                        author = self._extract_author(convo)
+                        timestamp = convo.get("timestamp") or convo.get("created_at")
+                        
+                        yield {
+                            'text': content,
+                            'metadata': {
+                                'source': 'conversation',
+                                'conversation_id': convo_idx,
+                                'message_id': 0,
+                                'author': author,
+                                'timestamp': timestamp
+                            }
+                        }
                             
         except json.JSONDecodeError as e:
             if strict_mode:
                 raise ValueError(f"Invalid JSON in conversations file {path}: {e}") from e
-            logger.error(f"Invalid JSON in conversations file {path}: {e}. Skipping.")
-            return
+            logger.error(f"Invalid JSON in conversations file {path}: {e}")
         except Exception as e:
             if strict_mode:
-                raise ValueError(f"Error reading conversations file {path} in strict mode: {e}") from e
-            logger.error(f"Error reading conversations file {path}: {e}. Skipping.")
-            return
+                raise ValueError(f"Error reading conversations file {path}: {e}") from e
+            logger.error(f"Error reading conversations file {path}: {e}")
+    
+    def _process_mapping_format(self, convo: dict, convo_idx: int, strict_mode: bool) -> Generator[Dict[str, Any], None, None]:
+        """Process ChatGPT mapping format"""
+        mapping = convo["mapping"]
+        for msg_id, msg_data in mapping.items():
+            try:
+                if not isinstance(msg_data, dict):
+                    if strict_mode:
+                        raise ValueError(f"Message data for ID {msg_id} is not a dictionary.")
+                    continue
+                    
+                message = msg_data.get("message")
+                if not message or not isinstance(message, dict):
+                    if strict_mode:
+                        raise ValueError(f"Message for ID {msg_id} is missing or not a dictionary.")
+                    continue
+                    
+                content = self._extract_message_content(message)
+                if content:
+                    author = self._extract_author(message)
+                    timestamp = message.get("create_time") or message.get("timestamp")
+                    
+                    yield {
+                        'text': content,
+                        'metadata': {
+                            'source': 'conversation',
+                            'conversation_id': convo_idx,
+                            'message_id': msg_id,
+                            'author': author,
+                            'timestamp': timestamp
+                        }
+                    }
+                    
+            except Exception as e:
+                if strict_mode:
+                    raise ValueError(f"Error processing message ID {msg_id}: {e}") from e
+                logger.debug(f"Skipping malformed message {msg_id}: {e}")
+    
+    def _extract_message_content(self, message: dict) -> str:
+        """Extract content from various message formats"""
+        if not isinstance(message, dict):
+            return ""
+        
+        content = message.get("content") or message.get("text") or message.get("message")
+        
+        if isinstance(content, str):
+            return content.strip()
+        elif isinstance(content, dict):
+            # Handle nested content structures
+            if "parts" in content and isinstance(content["parts"], list):
+                parts = content["parts"]
+                if parts and isinstance(parts[0], str):
+                    return parts[0].strip()
+            elif "text" in content:
+                return str(content["text"]).strip()
+        elif isinstance(content, list):
+            # Handle content as array
+            if content and isinstance(content[0], str):
+                return content[0].strip()
+            elif content and isinstance(content[0], dict):
+                # Handle array of content objects
+                for item in content:
+                    if isinstance(item, dict):
+                        text = item.get("text") or item.get("content")
+                        if text and isinstance(text, str):
+                            return text.strip()
+        
+        return ""
+    
+    def _extract_author(self, message: dict) -> str:
+        """Extract author/role from various message formats"""
+        if not isinstance(message, dict):
+            return "unknown"
+        
+        # Try different author field names
+        author_info = message.get("author") or message.get("role") or message.get("sender")
+        
+        if isinstance(author_info, dict):
+            role = author_info.get("role") or author_info.get("name") or "unknown"
+        elif isinstance(author_info, str):
+            role = author_info
+        else:
+            role = "unknown"
+        
+        # Normalize common role names
+        role = role.lower()
+        if role in ["human", "user"]:
+            return "user"
+        elif role in ["assistant", "ai", "claude"]:
+            return "assistant"
+        else:
+            return role
     
     def stream_pdf_chunks(self, json_path: str, strict_mode: bool = False) -> Generator[Dict[str, Any], None, None]:
-        """
-        Stream PDF chunks from a JSON file.
-        Expects a list of dictionaries, where each dict has a 'text' (or 'content', 'total_text', 'body') field.
-        If strict_mode is True, raises ValueError on schema mismatch.
-        """
+        """Stream PDF chunks from a JSON file"""
         if not os.path.exists(json_path):
             logger.warning(f"PDF JSON file not found: {json_path}")
             return
@@ -424,37 +498,27 @@ class ImprovedBatchEmbedder:
             with open(json_path, "r", encoding="utf-8") as f:
                 entries = json.load(f)
             
-            logger.debug(f"PDF data type: {type(entries)}")
-            
             if not isinstance(entries, list):
                 if strict_mode:
-                    raise ValueError(f"Expected list of PDF entries, got {type(entries)} in strict mode.")
-                logger.error(f"Expected list of PDF entries, got {type(entries)}. Skipping.")
+                    raise ValueError(f"Expected list of PDF entries, got {type(entries)}")
+                logger.error(f"Expected list of PDF entries, got {type(entries)}")
                 return
             
             for doc_idx, doc in enumerate(entries):
                 if not isinstance(doc, dict):
-                    logger.debug(f"Skipping non-dict entry at index {doc_idx}")
                     if strict_mode:
                         raise ValueError(f"PDF entry at index {doc_idx} is not a dictionary.")
                     continue
                 
                 text = ""
-                text_found = False
                 for text_field in ["text", "content", "total_text", "body"]:
                     if text_field in doc and isinstance(doc[text_field], str):
                         text = doc[text_field].strip()
-                        text_found = True
                         break
                 
-                if not text_found:
-                    logger.debug(f"No valid text field found in document {doc_idx}")
-                    if strict_mode:
-                        raise ValueError(f"Document {doc_idx} has no valid text field ('text', 'content', 'total_text', 'body').")
-                    continue
-                
                 if not text:
-                    logger.debug(f"Empty text content for document {doc_idx}")
+                    if strict_mode:
+                        raise ValueError(f"Document {doc_idx} has no valid text field.")
                     continue
                 
                 filename = doc.get("filename", f"document_{doc_idx}.pdf")
@@ -472,16 +536,15 @@ class ImprovedBatchEmbedder:
         except json.JSONDecodeError as e:
             if strict_mode:
                 raise ValueError(f"Invalid JSON in PDF file {json_path}: {e}") from e
-            logger.error(f"Invalid JSON in PDF file {json_path}: {e}. Skipping.")
-            return
+            logger.error(f"Invalid JSON in PDF file {json_path}: {e}")
         except Exception as e:
             if strict_mode:
-                raise ValueError(f"Error reading PDF file {json_path} in strict mode: {e}") from e
-            logger.error(f"Error reading PDF file {json_path}: {e}. Skipping.")
-            return
+                raise ValueError(f"Error reading PDF file {json_path}: {e}") from e
+            logger.error(f"Error reading PDF file {json_path}: {e}")
     
     def load_and_embed_all(self, 
                           convo_path: Optional[str] = None,
+                          convo_path2: Optional[str] = None,
                           pdf_json_path: Optional[str] = None,
                           custom_data: Optional[List[Dict[str, Any]]] = None,
                           strict_mode: bool = False) -> None:
@@ -490,60 +553,72 @@ class ImprovedBatchEmbedder:
         logger.info("🟢 Starting comprehensive embedding process...")
         start_time = time.time()
         
+        # Estimate total items for progress bar
         total_items_to_process = 0
-        if convo_path and os.path.exists(convo_path):
-            with open(convo_path, 'r', encoding='utf-8') as f:
+        
+        def estimate_convo_items(path):
+            count = 0
+            if path and os.path.exists(path):
                 try:
-                    data = json.load(f)
+                    with open(path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    
                     if isinstance(data, list):
-                        total_items_to_process += len(data)
-                    elif isinstance(data, dict) and "mapping" in data:
-                        total_items_to_process += len(data["mapping"])
-                    elif isinstance(data, dict) and "messages" in data:
-                         total_items_to_process += len(data["messages"])
-                    elif isinstance(data, dict): # For the case where the values are conversations
-                         total_items_to_process += sum(len(v.get("mapping", v.get("messages", []))) if isinstance(v, dict) else 0 for v in data.values())
-                except json.JSONDecodeError:
-                    logger.warning(f"Could not estimate count for {convo_path} due to JSON error.")
+                        count = len(data)
+                    elif isinstance(data, dict):
+                        if "conversations" in data:
+                            count = len(data["conversations"])
+                        elif "mapping" in data:
+                            count = len(data["mapping"])
+                        elif "messages" in data:
+                            count = len(data["messages"])
+                        else:
+                            count = sum(len(v) if isinstance(v, (list, dict)) else 1 for v in data.values())
+                except Exception as e:
+                    logger.warning(f"Could not estimate count for {path}: {e}")
+            return count
+
+        total_items_to_process += estimate_convo_items(convo_path)
+        total_items_to_process += estimate_convo_items(convo_path2)
 
         if pdf_json_path and os.path.exists(pdf_json_path):
-            with open(pdf_json_path, 'r', encoding='utf-8') as f:
-                try:
+            try:
+                with open(pdf_json_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    if isinstance(data, list):
-                        total_items_to_process += len(data)
-                except json.JSONDecodeError:
-                    logger.warning(f"Could not estimate count for {pdf_json_path} due to JSON error.")
+                if isinstance(data, list):
+                    total_items_to_process += len(data)
+            except Exception as e:
+                logger.warning(f"Could not estimate count for PDF file: {e}")
 
         if custom_data:
             total_items_to_process += len(custom_data)
 
-        pbar = tqdm(total=total_items_to_process, desc="Total Embedding Progress", unit="items")
+        pbar = tqdm(total=max(total_items_to_process, 1), desc="Total Embedding Progress", unit="items")
         
-        if convo_path:
-            logger.info(f"📥 Processing conversations from: {convo_path}")
-            batch = []
-            
-            try:
-                for msg_data in self.stream_conversations(convo_path, strict_mode=strict_mode):
-                    batch.append(msg_data)
-                    
-                    if len(batch) >= self.config.batch_size:
+        def process_convo_file(path, pbar_instance):
+            if path:
+                logger.info(f"📥 Processing conversations from: {path}")
+                batch = []
+                try:
+                    for msg_data in self.stream_conversations(path, strict_mode=strict_mode):
+                        batch.append(msg_data)
+                        if len(batch) >= self.config.batch_size:
+                            added = self.add_texts_batch(batch)
+                            pbar_instance.update(len(batch))
+                            batch = []
+                            if self.config.save_incremental and self.total_embedded % 1000 == 0:
+                                self._save_checkpoint()
+                    if batch:
                         added = self.add_texts_batch(batch)
-                        pbar.update(added)
-                        batch = []
-                        if self.config.save_incremental and self.total_embedded % 1000 == 0:
-                            self._save_checkpoint()
-                
-                if batch:
-                    added = self.add_texts_batch(batch)
-                    pbar.update(added)
-                
-                logger.info(f"✅ Finished processing conversations.")
-                
-            except Exception as e:
-                logger.error(f"Error processing conversations: {e}")
-                if strict_mode: raise e
+                        pbar_instance.update(len(batch))
+                    logger.info(f"✅ Finished processing conversations from {path}")
+                except Exception as e:
+                    logger.error(f"Error processing conversations from {path}: {e}")
+                    if strict_mode:
+                        raise e
+
+        process_convo_file(convo_path, pbar)
+        process_convo_file(convo_path2, pbar)
         
         if pdf_json_path:
             logger.info(f"📚 Processing PDF chunks from: {pdf_json_path}")
@@ -555,20 +630,21 @@ class ImprovedBatchEmbedder:
                     
                     if len(batch) >= self.config.batch_size:
                         added = self.add_texts_batch(batch)
-                        pbar.update(added)
+                        pbar.update(len(batch))
                         batch = []
                         if self.config.save_incremental and self.total_embedded % 1000 == 0:
                             self._save_checkpoint()
                 
                 if batch:
                     added = self.add_texts_batch(batch)
-                    pbar.update(added)
+                    pbar.update(len(batch))
                 
-                logger.info(f"✅ Finished processing PDF chunks.")
+                logger.info(f"✅ Finished processing PDF chunks")
                 
             except Exception as e:
                 logger.error(f"Error processing PDFs: {e}")
-                if strict_mode: raise e
+                if strict_mode:
+                    raise e
         
         if custom_data:
             logger.info(f"🔧 Processing custom data: {len(custom_data)} items")
@@ -576,19 +652,20 @@ class ImprovedBatchEmbedder:
                 for i in range(0, len(custom_data), self.config.batch_size):
                     batch = custom_data[i:i + self.config.batch_size]
                     added = self.add_texts_batch(batch)
-                    pbar.update(added)
+                    pbar.update(len(batch))
                     if self.config.save_incremental and self.total_embedded % 1000 == 0:
                         self._save_checkpoint()
             except Exception as e:
                 logger.error(f"Error processing custom data: {e}")
-                if strict_mode: raise e
+                if strict_mode:
+                    raise e
         
-        pbar.close() # Close progress bar once all data sources are processed
+        pbar.close()
         
         if self.total_embedded > 0:
             self.build_and_save_index()
         else:
-            logger.warning("No data was embedded. Check your input files and their structure, or consider strict_mode=True for detailed errors.")
+            logger.warning("No data was embedded. Check your input files and structure.")
         
         elapsed = time.time() - start_time
         logger.info(f"🎉 Embedding complete! Total: {self.total_embedded} items in {elapsed:.2f}s")
@@ -634,7 +711,7 @@ class ImprovedBatchEmbedder:
             return False
     
     def build_and_save_index(self, output_dir: str = ".") -> None:
-        """Build and save FAISS index with multiple options"""
+        """Build and save FAISS index"""
         if not self.memory_vectors:
             logger.warning("No vectors to index!")
             return
@@ -649,23 +726,20 @@ class ImprovedBatchEmbedder:
         
         if self.config.index_type == 'flat' or len(vectors) < 1000:
             self.index = faiss.IndexFlatL2(dimension)
-            logger.info("Using IndexFlatL2")
         elif self.config.index_type == 'ivf':
             nlist = min(int(np.sqrt(len(vectors))), 100)
             quantizer = faiss.IndexFlatL2(dimension)
             self.index = faiss.IndexIVFFlat(quantizer, dimension, nlist, faiss.METRIC_L2)
-            logger.info(f"Using IndexIVFFlat with nlist={nlist}. Training index...")
             self.index.train(vectors)
         elif self.config.index_type == 'hnsw':
             self.index = faiss.IndexHNSWFlat(dimension, 32, faiss.METRIC_L2)
             self.index.hnsw.efConstruction = 40
-            logger.info("Using IndexHNSWFlat")
         else:
             self.index = faiss.IndexFlatL2(dimension)
-            logger.warning(f"Unknown index_type '{self.config.index_type}'. Defaulting to IndexFlatL2.")
         
         self.index.add(vectors)
         
+        # Save all components
         index_path = output_path / "memory.index"
         faiss.write_index(self.index, str(index_path))
         logger.info(f"💾 FAISS index saved to: {index_path}")
@@ -709,53 +783,61 @@ class ImprovedBatchEmbedder:
         
         return results
 
-    def diagnose_json_files(self, convo_path: Optional[str] = None, pdf_path: Optional[str] = None) -> None:
+    def diagnose_json_files(self, convo_path: Optional[str] = None, convo_path2: Optional[str] = None, pdf_path: Optional[str] = None) -> None:
         """Diagnose JSON file structures for debugging"""
         logger.info("🔍 Diagnosing JSON file structures...")
         
-        if convo_path:
-            if not os.path.exists(convo_path):
-                logger.warning(f"Conversations file not found: {convo_path}")
-            else:
-                try:
-                    with open(convo_path, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                    
-                    logger.info(f"📄 Conversations file ({convo_path}):")
-                    logger.info(f"  - Type: {type(data)}")
-                    logger.info(f"  - Length: {len(data) if hasattr(data, '__len__') else 'N/A'}")
-                    
-                    if isinstance(data, list) and len(data) > 0:
-                        first_item = data[0]
-                        logger.info(f"  - First item type: {type(first_item)}")
-                        if isinstance(first_item, dict):
-                            logger.info(f"  - First item keys: {list(first_item.keys())}")
-                            if 'mapping' in first_item:
-                                logger.info("  - Appears to be ChatGPT 'mapping' format.")
-                                if first_item['mapping']:
-                                    first_map_id = list(first_item['mapping'].keys())[0]
-                                    first_map_msg = first_item['mapping'][first_map_id]
-                                    logger.info(f"    - First mapping message keys: {list(first_map_msg.keys())}")
-                                    if 'message' in first_map_msg and isinstance(first_map_msg['message'], dict):
-                                        logger.info(f"      - 'message' content keys: {list(first_map_msg['message'].get('content', {}).keys())}")
-                            elif 'messages' in first_item and isinstance(first_item['messages'], list):
-                                logger.info("  - Appears to be 'messages' array format.")
-                                if first_item['messages']:
-                                    logger.info(f"    - First message in 'messages' keys: {list(first_item['messages'][0].keys())}")
-                    
-                    elif isinstance(data, dict):
-                        logger.info(f"  - Root keys: {list(data.keys())}")
-                        if 'mapping' in data:
-                            logger.info("  - Appears to be a single ChatGPT 'mapping' conversation at root.")
-                            if data['mapping']:
-                                first_map_id = list(data['mapping'].keys())[0]
-                                first_map_msg = data['mapping'][first_map_id]
+        def _diagnose_single_convo_file(path):
+            if not os.path.exists(path):
+                logger.warning(f"Conversations file not found: {path}")
+                return
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                logger.info(f"📄 Conversations file ({path}):")
+                logger.info(f"  - Type: {type(data)}")
+                logger.info(f"  - Length: {len(data) if hasattr(data, '__len__') else 'N/A'}")
+                
+                if isinstance(data, list) and len(data) > 0:
+                    first_item = data[0]
+                    logger.info(f"  - First item type: {type(first_item)}")
+                    if isinstance(first_item, dict):
+                        logger.info(f"  - First item keys: {list(first_item.keys())}")
+                        if 'mapping' in first_item:
+                            logger.info("  - Appears to be ChatGPT 'mapping' format.")
+                            if first_item['mapping']:
+                                first_map_id = list(first_item['mapping'].keys())[0]
+                                first_map_msg = first_item['mapping'][first_map_id]
                                 logger.info(f"    - First mapping message keys: {list(first_map_msg.keys())}")
                                 if 'message' in first_map_msg and isinstance(first_map_msg['message'], dict):
+                                    author_role = first_map_msg['message'].get('author', {}).get('role', 'N/A')
                                     logger.info(f"      - 'message' content keys: {list(first_map_msg['message'].get('content', {}).keys())}")
+                                    logger.info(f"      - Example author role: '{author_role}'")
+                        elif 'messages' in first_item and isinstance(first_item['messages'], list):
+                            logger.info("  - Appears to be 'messages' array format.")
+                            if first_item['messages']:
+                                logger.info(f"    - First message in 'messages' keys: {list(first_item['messages'][0].keys())}")
+                                author_role = first_item['messages'][0].get('role', 'N/A')
+                                logger.info(f"    - Example author role: '{author_role}'")
+                
+                elif isinstance(data, dict):
+                    logger.info(f"  - Root keys: {list(data.keys())}")
+                    if 'mapping' in data:
+                        logger.info("  - Appears to be a single ChatGPT 'mapping' conversation at root.")
+                        if data['mapping']:
+                            first_map_id = list(data['mapping'].keys())[0]
+                            first_map_msg = data['mapping'][first_map_id]
+                            logger.info(f"    - First mapping message keys: {list(first_map_msg.keys())}")
+                            if 'message' in first_map_msg and isinstance(first_map_msg['message'], dict):
+                                author_role = first_map_msg['message'].get('author', {}).get('role', 'N/A')
+                                logger.info(f"      - 'message' content keys: {list(first_map_msg['message'].get('content', {}).keys())}")
+                                logger.info(f"      - Example author role: '{author_role}'")
+            except Exception as e:
+                logger.error(f"Error diagnosing conversations file {path}: {e}")
 
-                except Exception as e:
-                    logger.error(f"Error diagnosing conversations file {convo_path}: {e}")
+        _diagnose_single_convo_file(convo_path)
+        _diagnose_single_convo_file(convo_path2) # Diagnose the new conversation file
         
         if pdf_path:
             if not os.path.exists(pdf_path):
@@ -809,13 +891,15 @@ def main():
     
     embedder = ImprovedBatchEmbedder(config)
     
-    embedder.diagnose_json_files("conversations.json", "pdf_texts.json")
+    # Diagnose both conversation files
+    embedder.diagnose_json_files("conversations.json", "conversations2.json", "pdf_texts.json")
     
     if embedder.load_checkpoint():
         logger.info("Resuming from checkpoint...")
     
     embedder.load_and_embed_all(
         convo_path="conversations.json",
+        convo_path2="conversations2.json", # Pass the new conversation file path
         pdf_json_path="pdf_texts.json",
         strict_mode=False
     )
