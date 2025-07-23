@@ -16,7 +16,7 @@ import time
 import re
 
 # Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s') # Reverted to INFO
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -26,14 +26,14 @@ class EmbeddingConfig:
     batch_size: int = 32
     chunk_size: int = 512
     max_chunk_overlap: int = 50
-    min_text_length: int = 20
-    max_text_length: int = 2000
+    min_text_length: int = 15  # Relaxed from 20/30
+    max_text_length: int = 2000 # This now acts more as a max chunk length, not total message length
     index_type: str = 'flat'
     use_gpu: bool = False
     save_incremental: bool = True
     deduplication: bool = True
-    min_sentence_length: int = 5
-    max_non_alpha_ratio: float = 0.5
+    min_sentence_length: int = 5   # Relaxed from 10
+    max_non_alpha_ratio: float = 0.6 # Relaxed from 0.5/0.4
     filter_common_patterns: bool = True
     num_cpu_threads: Optional[int] = None  # None = auto-detect
     enable_parallel_processing: bool = True
@@ -142,48 +142,72 @@ class ImprovedBatchEmbedder:
     def _clean_and_validate_text(self, text: str) -> str:
         """Clean and validate text before processing"""
         if not isinstance(text, str):
+            logger.debug(f"Skipping text: Not a string (type: {type(text)}).")
             return ""
         
+        original_text_snippet = text[:100].replace('\n', '\\n') + ('...' if len(text) > 100 else '')
         text = text.strip()
         
         if len(text) < self.config.min_text_length:
+            logger.debug(f"Skipping text: Too short ({len(text)} chars < {self.config.min_text_length}). Text: '{original_text_snippet}'")
             return ""
         
-        if len(text) > self.config.max_text_length:
-            text = text[:self.config.max_text_length]
+        # Removed the hard truncation here. _chunk_text will handle splitting long texts.
+        # if len(text) > self.config.max_text_length:
+        #     logger.debug(f"Truncating text: Too long ({len(text)} chars > {self.config.max_text_length}). Text: '{original_text_snippet}'")
+        #     text = text[:self.config.max_text_length]
         
-        if len(text.split()) < self.config.min_sentence_length:
+        words = text.split()
+        if len(words) < self.config.min_sentence_length:
+            logger.debug(f"Skipping text: Too few words ({len(words)} words < {self.config.min_sentence_length}). Text: '{original_text_snippet}'")
             return ""
             
         alpha_count = sum(1 for c in text if c.isalpha())
         if len(text) > 0 and alpha_count / len(text) < (1 - self.config.max_non_alpha_ratio):
+            logger.debug(f"Skipping text: Too many non-alpha chars (ratio: {alpha_count / len(text):.2f} < {1 - self.config.max_non_alpha_ratio:.2f}). Text: '{original_text_snippet}'")
             return ""
         
         if self.config.filter_common_patterns:
             if re.match(r'^[\s\d\W]*$', text):
+                logger.debug(f"Skipping text: Matches common low-quality pattern. Text: '{original_text_snippet}'")
                 return ""
         
         return text
     
     def _chunk_text(self, text: str, metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Split text into chunks with metadata"""
+        """Split text into chunks with metadata. Ensures chunks are not too long."""
         if not text:
             return []
         
         chunks = []
         words = text.split()
         
-        if len(words) <= self.config.chunk_size:
+        # If the text is shorter than or equal to the desired chunk size, return it as a single chunk.
+        if len(words) <= self.config.chunk_size and len(text) <= self.config.max_text_length:
             return [{
                 'text': text,
                 'metadata': {**metadata, 'chunk_id': 0, 'total_chunks': 1}
             }]
         
-        for i in range(0, len(words), max(1, self.config.chunk_size - self.config.max_chunk_overlap)):
+        # Otherwise, proceed with chunking
+        i = 0
+        while i < len(words):
             chunk_words = words[i:i + self.config.chunk_size]
             chunk_text = ' '.join(chunk_words)
             
+            # Ensure the chunk itself doesn't exceed max_text_length (character count)
+            # This is a secondary check, as chunk_size is based on words.
+            if len(chunk_text) > self.config.max_text_length:
+                # If a single word makes it too long, or if a chunk is too long,
+                # we might need to adjust chunk_size or max_text_length config.
+                # For now, we'll truncate the chunk to max_text_length if it exceeds it.
+                # This is a fallback if word-based chunking results in very long char chunks.
+                chunk_text = chunk_text[:self.config.max_text_length]
+                logger.debug(f"Chunk text truncated to {self.config.max_text_length} chars to fit max_text_length config. Original chunk length: {len(chunk_text)} chars.")
+
             if len(chunk_text.strip()) < self.config.min_text_length:
+                # Skip very short chunks that might result from aggressive chunking
+                i += max(1, self.config.chunk_size - self.config.max_chunk_overlap)
                 continue
             
             chunks.append({
@@ -191,10 +215,13 @@ class ImprovedBatchEmbedder:
                 'metadata': {
                     **metadata,
                     'chunk_id': len(chunks),
-                    'total_chunks': -1
+                    'total_chunks': -1 # Will be updated after all chunks are known
                 }
             })
+            
+            i += max(1, self.config.chunk_size - self.config.max_chunk_overlap)
         
+        # Update total_chunks metadata for all generated chunks
         for chunk in chunks:
             chunk['metadata']['total_chunks'] = len(chunks)
         
@@ -217,32 +244,35 @@ class ImprovedBatchEmbedder:
             cleaned_text = self._clean_and_validate_text(original_text)
             
             if cleaned_text:
+                # _chunk_text now handles splitting long messages into multiple chunks
                 chunks = self._chunk_text(cleaned_text, metadata)
                 processed_items.extend(chunks)
             else:
-                logger.debug(f"Skipping text due to cleaning/validation: '{original_text[:50]}...'")
+                # Debug message already in _clean_and_validate_text
+                pass
         
         if not processed_items:
+            logger.debug("No items left after initial cleaning and chunking for this batch.")
             return 0
         
-        texts_to_embed = [item['text'] for item in processed_items]
-        metadata_for_embed = [item['metadata'] for item in processed_items]
+        texts_to_embed = []
+        metadata_for_embed = []
 
         if self.config.deduplication:
-            unique_texts = []
-            unique_metadata = []
-            
-            for text, meta in zip(texts_to_embed, metadata_for_embed):
-                text_hash = self._get_text_hash(text)
+            for item in processed_items:
+                text_hash = self._get_text_hash(item['text'])
                 if text_hash not in self.text_hashes:
                     self.text_hashes.add(text_hash)
-                    unique_texts.append(text)
-                    unique_metadata.append(meta)
-            
-            texts_to_embed = unique_texts
-            metadata_for_embed = unique_metadata
+                    texts_to_embed.append(item['text'])
+                    metadata_for_embed.append(item['metadata'])
+                else:
+                    logger.debug(f"Skipping text due to deduplication: '{item['text'][:50]}...'")
+        else:
+            texts_to_embed = [item['text'] for item in processed_items]
+            metadata_for_embed = [item['metadata'] for item in processed_items]
 
         if not texts_to_embed:
+            logger.debug("No unique items left after deduplication for this batch.")
             return 0
 
         if self.config.enable_parallel_processing and not self.config.use_gpu:
@@ -250,16 +280,19 @@ class ImprovedBatchEmbedder:
         else:
             embeddings = self._embed_batch(texts_to_embed)
         
+        added_count_current_batch = 0
         for i, emb in enumerate(embeddings):
             if emb is not None and not np.all(emb == 0):
                 self.memory_texts.append(texts_to_embed[i])
                 self.memory_vectors.append(emb)
                 self.memory_metadata.append(metadata_for_embed[i])
+                added_count_current_batch += 1
+            else:
+                logger.warning(f"Skipping embedding for text due to zero vector: '{texts_to_embed[i][:50]}...'")
         
-        added_count = len(embeddings)
-        self.total_embedded += added_count
+        self.total_embedded += added_count_current_batch
         
-        return added_count
+        return added_count_current_batch
     
     def stream_conversations(self, path: str, strict_mode: bool = False) -> Generator[Dict[str, Any], None, None]:
         """
@@ -280,7 +313,7 @@ class ImprovedBatchEmbedder:
             conversations = []
             
             if isinstance(data, list):
-                # Direct list of conversations or messages
+                # This is the primary path for the user's conversations2.json (list of conversation objects)
                 conversations = data
             elif isinstance(data, dict):
                 # Check for various dictionary formats
@@ -311,18 +344,49 @@ class ImprovedBatchEmbedder:
                     logger.debug(f"Skipping non-dict conversation entry at index {convo_idx}")
                     continue
                 
-                # Handle ChatGPT mapping format
-                if "mapping" in convo:
-                    self._process_mapping_format(convo, convo_idx, strict_mode)
+                # --- START OF LOGIC FOR CLAUDE EXPORT FORMAT (integrated) ---
+                # Check if it's a conversation object containing 'chat_messages'
+                if "chat_messages" in convo and isinstance(convo["chat_messages"], list):
+                    conversation_uuid = convo.get("uuid", f"convo_{convo_idx}") # Get conversation UUID
+                    messages = convo["chat_messages"]
+                    logger.debug(f"Processing conversation '{conversation_uuid}' with {len(messages)} messages.")
+                    for msg_idx, msg in enumerate(messages):
+                        try:
+                            if isinstance(msg, dict):
+                                content = self._extract_message_content(msg)
+                                if content:
+                                    author = self._extract_author(msg)
+                                    timestamp = msg.get("created_at") or msg.get("updated_at") or msg.get("timestamp") or msg.get("time")
+                                    
+                                    yield {
+                                        'text': content,
+                                        'metadata': {
+                                            'source': 'conversation',
+                                            'conversation_id': conversation_uuid, # Use conversation UUID
+                                            'message_id': msg.get("uuid", msg_idx), # Use message UUID if available
+                                            'author': author,
+                                            'timestamp': timestamp
+                                        }
+                                    }
+                            elif strict_mode:
+                                raise ValueError(f"Message at index {msg_idx} in conversation {conversation_uuid} is not a dictionary.")
+                        except Exception as e:
+                            if strict_mode:
+                                raise ValueError(f"Error processing message at index {msg_idx} in conversation {conversation_uuid}: {e}") from e
+                            logger.debug(f"Skipping message at index {msg_idx} in conversation {conversation_uuid}: {e}")
+                # --- END OF LOGIC FOR CLAUDE EXPORT FORMAT ---
+
+                # Handle ChatGPT mapping format (original logic, will be skipped if chat_messages found)
+                elif "mapping" in convo:
+                    yield from self._process_mapping_format(convo, convo_idx, strict_mode)
                 
-                # Handle messages array format
+                # Handle messages array format (original logic, will be skipped if chat_messages found)
                 elif "messages" in convo:
                     messages = convo["messages"]
                     if isinstance(messages, list):
                         for msg_idx, msg in enumerate(messages):
                             try:
                                 if isinstance(msg, dict):
-                                    # Handle different message structures
                                     content = self._extract_message_content(msg)
                                     if content:
                                         author = self._extract_author(msg)
@@ -339,37 +403,18 @@ class ImprovedBatchEmbedder:
                                             }
                                         }
                                 elif strict_mode:
-                                    raise ValueError(f"Message at index {msg_idx} is not a dictionary.")
+                                    raise ValueError(f"Message at index {msg_idx} in conversation {convo_idx} is not a dictionary.")
                             except Exception as e:
                                 if strict_mode:
-                                    raise ValueError(f"Error processing message at index {msg_idx}: {e}") from e
-                                logger.debug(f"Skipping message at index {msg_idx}: {e}")
+                                    raise ValueError(f"Error processing message at index {msg_idx} in conversation {convo_idx}: {e}") from e
+                                logger.debug(f"Skipping message at index {msg_idx} in conversation {convo_idx}: {e}")
                     else:
                         if strict_mode:
                             raise ValueError(f"'messages' in conversation {convo_idx} is not a list.")
                         logger.debug(f"'messages' in conversation {convo_idx} is not a list, skipping")
                 
-                # Handle Claude chat format (array of turn objects)
-                elif isinstance(convo, list):
-                    for turn_idx, turn in enumerate(convo):
-                        if isinstance(turn, dict):
-                            content = self._extract_message_content(turn)
-                            if content:
-                                author = self._extract_author(turn)
-                                timestamp = turn.get("timestamp") or turn.get("created_at")
-                                
-                                yield {
-                                    'text': content,
-                                    'metadata': {
-                                        'source': 'conversation',
-                                        'conversation_id': convo_idx,
-                                        'message_id': turn_idx,
-                                        'author': author,
-                                        'timestamp': timestamp
-                                    }
-                                }
-                
-                # Handle direct message format (single message object)
+                # Handle direct message format (e.g., older Claude chat exports or simple lists of messages)
+                # This path is less likely if the above 'chat_messages' logic handles the primary format
                 else:
                     content = self._extract_message_content(convo)
                     if content:
@@ -380,8 +425,8 @@ class ImprovedBatchEmbedder:
                             'text': content,
                             'metadata': {
                                 'source': 'conversation',
-                                'conversation_id': convo_idx,
-                                'message_id': 0,
+                                'conversation_id': convo_idx, # This will be the message's index in the top-level list
+                                'message_id': convo.get("uuid", convo_idx), # Use UUID if available, else index
                                 'author': author,
                                 'timestamp': timestamp
                             }
@@ -438,12 +483,13 @@ class ImprovedBatchEmbedder:
         if not isinstance(message, dict):
             return ""
         
-        content = message.get("content") or message.get("text") or message.get("message")
+        # Prioritize 'text' field, then 'content'
+        content = message.get("text") or message.get("content") or message.get("message")
         
         if isinstance(content, str):
             return content.strip()
         elif isinstance(content, dict):
-            # Handle nested content structures
+            # Handle nested content structures like {"parts": ["text"]} or {"text": "..."}
             if "parts" in content and isinstance(content["parts"], list):
                 parts = content["parts"]
                 if parts and isinstance(parts[0], str):
@@ -451,16 +497,19 @@ class ImprovedBatchEmbedder:
             elif "text" in content:
                 return str(content["text"]).strip()
         elif isinstance(content, list):
-            # Handle content as array
-            if content and isinstance(content[0], str):
-                return content[0].strip()
-            elif content and isinstance(content[0], dict):
-                # Handle array of content objects
-                for item in content:
-                    if isinstance(item, dict):
-                        text = item.get("text") or item.get("content")
-                        if text and isinstance(text, str):
-                            return text.strip()
+            # Handle content as array (e.g., list of strings or list of content objects)
+            if content:
+                # Try to join string parts if it's a list of strings
+                if all(isinstance(item, str) for item in content):
+                    return " ".join(item.strip() for item in content).strip() # Ensure stripping each part
+                # If it's a list of dictionaries, try to extract text from each
+                elif all(isinstance(item, dict) for item in content):
+                    extracted_parts = []
+                    for item in content:
+                        part_text = item.get("text") or item.get("content")
+                        if isinstance(part_text, str):
+                            extracted_parts.append(part_text.strip()) # Ensure stripping each part
+                    return " ".join(extracted_parts).strip()
         
         return ""
     
@@ -564,7 +613,20 @@ class ImprovedBatchEmbedder:
                         data = json.load(f)
                     
                     if isinstance(data, list):
-                        count = len(data)
+                        # For Claude format, estimate total messages by summing chat_messages lengths
+                        # For other list formats, count top-level items
+                        is_claude_format = False
+                        if data and isinstance(data[0], dict) and "chat_messages" in data[0]:
+                            is_claude_format = True
+                        
+                        if is_claude_format:
+                            for convo_obj in data:
+                                if isinstance(convo_obj, dict) and "chat_messages" in convo_obj and isinstance(convo_obj["chat_messages"], list):
+                                    count += len(convo_obj["chat_messages"])
+                                else:
+                                    count += 1 # Fallback for unexpected items in a Claude list
+                        else:
+                            count = len(data)
                     elif isinstance(data, dict):
                         if "conversations" in data:
                             count = len(data["conversations"])
@@ -804,22 +866,47 @@ class ImprovedBatchEmbedder:
                     logger.info(f"  - First item type: {type(first_item)}")
                     if isinstance(first_item, dict):
                         logger.info(f"  - First item keys: {list(first_item.keys())}")
-                        if 'mapping' in first_item:
-                            logger.info("  - Appears to be ChatGPT 'mapping' format.")
+                        if 'chat_messages' in first_item and isinstance(first_item['chat_messages'], list):
+                            logger.info("  - Appears to be a list of Claude conversation objects (contains 'chat_messages').")
+                            if first_item['chat_messages']:
+                                first_chat_message = first_item['chat_messages'][0]
+                                logger.info(f"    - First chat_message keys: {list(first_chat_message.keys())}")
+                                logger.info(f"    - First chat_message sender: {first_chat_message.get('sender')}")
+                                logger.info(f"    - First chat_message text snippet: '{first_chat_message.get('text', '')[:50]}...'")
+                                if isinstance(first_chat_message.get('content'), list) and len(first_chat_message['content']) > 0:
+                                    logger.info(f"    - First chat_message content[0] keys: {list(first_chat_message['content'][0].keys())}")
+                                    logger.info(f"    - First chat_message content[0] text snippet: '{first_chat_message['content'][0].get('text', '')[:50]}...'")
+                            else:
+                                logger.info("  - 'chat_messages' list is empty in the first conversation object.")
+                        elif 'mapping' in first_item:
+                            logger.info("  - Appears to be ChatGPT 'mapping' format (list of conversations).")
                             if first_item['mapping']:
                                 first_map_id = list(first_item['mapping'].keys())[0]
                                 first_map_msg = first_item['mapping'][first_map_id]
                                 logger.info(f"    - First mapping message keys: {list(first_map_msg.keys())}")
                                 if 'message' in first_map_msg and isinstance(first_map_msg['message'], dict):
                                     author_role = first_map_msg['message'].get('author', {}).get('role', 'N/A')
-                                    logger.info(f"      - 'message' content keys: {list(first_map_msg['message'].get('content', {}).keys())}")
+                                    content_keys = list(first_map_msg['message'].get('content', {}).keys())
+                                    logger.info(f"      - 'message' content keys: {content_keys}")
                                     logger.info(f"      - Example author role: '{author_role}'")
                         elif 'messages' in first_item and isinstance(first_item['messages'], list):
-                            logger.info("  - Appears to be 'messages' array format.")
+                            logger.info("  - Appears to be 'messages' array format (list of conversations).")
                             if first_item['messages']:
                                 logger.info(f"    - First message in 'messages' keys: {list(first_item['messages'][0].keys())}")
                                 author_role = first_item['messages'][0].get('role', 'N/A')
                                 logger.info(f"    - Example author role: '{author_role}'")
+                        elif 'sender' in first_item and 'text' in first_item and 'content' in first_item:
+                            logger.info("  - Appears to be a direct list of message objects (e.g., simple chat export).")
+                            logger.info(f"    - First message sender: {first_item.get('sender')}")
+                            logger.info(f"    - First message text snippet: '{first_item.get('text', '')[:50]}...'")
+                            if isinstance(first_item.get('content'), list) and len(first_item['content']) > 0:
+                                logger.info(f"    - First message content[0] keys: {list(first_item['content'][0].keys())}")
+                                logger.info(f"    - First message content[0] text snippet: '{first_item['content'][0].get('text', '')[:50]}...'")
+                        else:
+                            logger.info("  - Does NOT appear to be a recognized conversation format at the top level.")
+                            logger.info(f"    - First item structure: {json.dumps(first_item, indent=2)[:500]}...") # Print more of the structure
+                    else:
+                        logger.info(f"  - First item is not a dictionary, type: {type(first_item)}")
                 
                 elif isinstance(data, dict):
                     logger.info(f"  - Root keys: {list(data.keys())}")
@@ -831,8 +918,18 @@ class ImprovedBatchEmbedder:
                             logger.info(f"    - First mapping message keys: {list(first_map_msg.keys())}")
                             if 'message' in first_map_msg and isinstance(first_map_msg['message'], dict):
                                 author_role = first_map_msg['message'].get('author', {}).get('role', 'N/A')
-                                logger.info(f"      - 'message' content keys: {list(first_map_msg['message'].get('content', {}).keys())}")
+                                content_keys = list(first_map_msg['message'].get('content', {}).keys())
+                                logger.info(f"      - 'message' content keys: {content_keys}")
                                 logger.info(f"      - Example author role: '{author_role}'")
+                    elif 'messages' in data:
+                        logger.info("  - Appears to be a single conversation with 'messages' array at root.")
+                        if data['messages'] and isinstance(data['messages'], list):
+                            logger.info(f"    - First message in 'messages' keys: {list(data['messages'][0].keys())}")
+                            author_role = data['messages'][0].get('role', 'N/A')
+                            logger.info(f"    - Example author role: '{author_role}'")
+                    else:
+                        logger.info("  - Does NOT appear to be a recognized conversation format at the root level.")
+                        logger.info(f"    - Full root structure: {json.dumps(data, indent=2)[:500]}...") # Print more of the structure
             except Exception as e:
                 logger.error(f"Error diagnosing conversations file {path}: {e}")
 
@@ -844,7 +941,7 @@ class ImprovedBatchEmbedder:
                 logger.warning(f"PDF file not found: {pdf_path}")
             else:
                 try:
-                    with open(pdf_path, 'r', encoding='utf-8') as f:
+                    with open(pdf_path, 'r', encoding="utf-8") as f:
                         data = json.load(f)
                     
                     logger.info(f"📚 PDF file ({pdf_path}):")
@@ -877,12 +974,12 @@ def main():
         batch_size=64,
         chunk_size=400,
         max_chunk_overlap=50,
-        min_text_length=30,
+        min_text_length=15, # Adjusted
         use_gpu=False,  # Set to True if you have a compatible GPU (CUDA)
         index_type='flat',
         deduplication=True,
-        min_sentence_length=10,
-        max_non_alpha_ratio=0.4,
+        min_sentence_length=5, # Adjusted
+        max_non_alpha_ratio=0.6, # Adjusted
         filter_common_patterns=True,
         num_cpu_threads=None,
         enable_parallel_processing=True,
@@ -901,7 +998,7 @@ def main():
         convo_path="conversations.json",
         convo_path2="conversations2.json", # Pass the new conversation file path
         pdf_json_path="pdf_texts.json",
-        strict_mode=False
+        strict_mode=False # Keep this as False to avoid crashing on minor issues, but check logs
     )
     
     if embedder.total_embedded > 0:
@@ -926,4 +1023,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
