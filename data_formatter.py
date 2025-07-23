@@ -646,8 +646,7 @@ class OptimizedDataProcessor:
                 if not text:
                     continue
                 
-                # Modified to accept 'user' or 'human' as user roles
-                if author in ['user', 'human']: 
+                if author == 'user':
                     current_user_msg = msg
                     context_text = ""
                     if len(conversation_context) > 0:
@@ -1101,4 +1100,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
