@@ -40,7 +40,7 @@ python3 -m spacy download en_core_web_sm
 
 ```
 AI_Fine_Tuning_Pipeline/
-├── PDFs/                   # Raw PDFs to be parsed into text
+├── PDFs/                   # Raw PDFs to be parsed into text, but is buggy best to just use the Q&A pairs from the conversations.json
 ├── data_finetune/          # Clean Q&A dataset generated for fine-tuning. Created once `data_formatter.py` is ran
 ├── dialogpt-finetuned/     # Checkpoint outputs from training. Created once `train.py` is ran 
 ├── conversations.json      # Your exported conversation history from ChatGPT
