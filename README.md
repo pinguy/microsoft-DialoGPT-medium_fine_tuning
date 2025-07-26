@@ -74,7 +74,7 @@ python3 pdf_to_json.py
 
 ### 2. Add Chat History
 
-Rename your largest `conversations.json` export from ChatGPT (or other AI logs) and place it in the root folder. If using more the two `conversations.json`. For ChatGPT keep it called `conversations.json` but if also using the chats from Claude name those `conversations2.json`.
+Rename your largest `conversations.json` export from ChatGPT (or other AI logs) and place it in the root folder. If using more then two `conversations.json`,for ChatGPT keep it called `conversations.json` but if also using the chats from Claude name those `conversations2.json`.
 
 ---
 
