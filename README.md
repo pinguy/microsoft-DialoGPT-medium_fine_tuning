@@ -68,7 +68,7 @@ AI_Fine_Tuning_Pipeline/
 python3 pdf_to_json.py
 ```
 
-> Converts each PDF into chunked text with metadata.
+> Converts each PDF into chunked text with metadata. but advise not to use that yet as its not there yet.
 
 ---
 
@@ -98,10 +98,10 @@ python3 batch_embedder.py
 python3 data_formatter.py
 ```
 
-> Cleans, deduplicates, and formats Q\&A pairs into `data_finetune/`.
+> Cleans, deduplicates, and formats Q&A pairs into `data_finetune/`.
 > 
 > If you run into issues, tweak `self.quality_score_threshold`.
-> Higher values give fewer examples but better quality.
+> Higher values give fewer examples but better quality. mainly if you are using PDFs.
 
 ---
 
