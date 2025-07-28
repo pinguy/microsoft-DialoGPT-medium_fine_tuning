@@ -52,7 +52,7 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 @dataclass
 class Config:
     base_dir: str = "./dialogpt-finetuned/"
-    coherence_threshold: float = 0.4
+    coherence_threshold: float = 0.4 # Lowered slightly for more flexibility, but still effective
     use_coherence: bool = True
     vosk_model_path: str = "vosk-model-en-us-0.42-gigaspeech"
     server_port: int = 7860
@@ -599,6 +599,22 @@ class EnhancedChatBot:
             )
         
         print("✅ Model pre-warmed")
+
+    def _get_canned_response(self, user_input: str) -> Optional[str]:
+        """Provides predefined responses for common, simple inputs."""
+        normalized_input = user_input.lower().strip()
+        
+        # Specific matches for common greetings
+        if normalized_input in ["hi", "hello", "hey", "greetings"]:
+            return np.random.choice(["Hello there!", "Hi! How can I help you today?", "Hey! Nice to chat with you."])
+        elif normalized_input in ["how are you", "how are you doing", "how's it going"]:
+            return np.random.choice(["I'm doing great, thank you for asking!", "As an AI, I don't have feelings, but I'm ready to assist you!", "I'm functioning perfectly! How about you?"])
+        elif normalized_input in ["thank you", "thanks", "cheers"]:
+            return np.random.choice(["You're welcome!", "No problem at all!", "Glad I could help!"])
+        elif normalized_input in ["goodbye", "bye", "see you"]:
+            return np.random.choice(["Goodbye!", "See you later!", "Farewell!"])
+        
+        return None
     
     def generate_response_optimized(self, user_input: str) -> Tuple[str, str]:
         """
@@ -607,19 +623,29 @@ class EnhancedChatBot:
         """
         start_time = time.perf_counter()
         
-        # 1. Check cache first for immediate response
+        # 1. Check for canned responses first for immediate and precise replies
+        canned_response = self._get_canned_response(user_input)
+        if canned_response:
+            duration = time.perf_counter() - start_time
+            self.performance_monitor.log_response_time(duration, "canned")
+            self.response_cache.put(user_input, canned_response) # Cache canned responses too
+            return canned_response, "canned"
+
+        # 2. Check cache for previously generated responses
         cached_response = self.response_cache.get(user_input)
         if cached_response:
             duration = time.perf_counter() - start_time
             self.performance_monitor.log_response_time(duration, "cached")
             return cached_response, "cached"
         
-        # 2. Select the best generation configuration based on input characteristics
+        # 3. Select the best generation configuration based on input characteristics
         config_idx = self._select_generation_config(user_input)
         gen_config = self.generation_configs[config_idx]
         
+        response = ""
+        method = f"optimized_{gen_config['name']}"
         try:
-            # 3. Format input for the model (DialoGPT specific format)
+            # 4. Format input for the model (DialoGPT specific format)
             formatted_input = f"<|user|>\n{user_input}\n<|assistant|>\n"
             
             with torch_inference_mode(): # Optimize for inference
@@ -631,7 +657,7 @@ class EnhancedChatBot:
                     padding=False # No padding needed for single input
                 ).to(DEVICE)
                 
-                # 4. Generate response using the selected configuration
+                # 5. Generate response using the selected configuration
                 outputs = self.model.generate(
                     **inputs,
                     **{k: v for k, v in gen_config.items() if k != 'name'}, # Pass all config params except 'name'
@@ -640,7 +666,7 @@ class EnhancedChatBot:
                     use_cache=True # Enable KV caching for faster subsequent token generation
                 )
             
-            # 5. Decode and post-process the generated tokens
+            # 6. Decode and post-process the generated tokens
             response = self.tokenizer.decode(
                 outputs[0][inputs.input_ids.shape[1]:], # Decode only the newly generated tokens
                 skip_special_tokens=True
@@ -648,11 +674,26 @@ class EnhancedChatBot:
             
             response = self._post_process_response(response) # Apply robust cleaning
             
+            # 7. Coherence check: Ensure the generated response is relevant to the input
+            if config.use_coherence and self.coherence_model and response:
+                try:
+                    user_embedding = self.coherence_model.encode(user_input, convert_to_tensor=True).to(DEVICE)
+                    response_embedding = self.coherence_model.encode(response, convert_to_tensor=True).to(DEVICE)
+                    coherence_score = torch.nn.functional.cosine_similarity(user_embedding, response_embedding).item()
+                    print(f"Coherence score: {coherence_score:.2f} (Threshold: {config.coherence_threshold})")
+
+                    if coherence_score < config.coherence_threshold:
+                        print("⚠️ Response coherence too low. Falling back to intelligent response.")
+                        response = self._get_intelligent_fallback(user_input)
+                        method = "coherence_fallback" # Update method for logging
+                except Exception as e:
+                    print(f"Coherence check error: {e}")
+                    # Continue with the generated response if coherence check itself fails
+            
             if response and len(response) > 10: # Ensure response is meaningful
                 self.response_cache.put(user_input, response) # Cache the successful response
                 
                 duration = time.perf_counter() - start_time
-                method = f"optimized_{gen_config['name']}"
                 self.performance_monitor.log_response_time(duration, method)
                 
                 return response, method
@@ -661,7 +702,7 @@ class EnhancedChatBot:
             print(f"❌ Generation error: {e}")
             self.stats['error_count'] += 1 # Increment error count
         
-        # 6. Fallback if generation fails or is problematic
+        # 8. Fallback if generation fails or is problematic (after all attempts)
         fallback = self._get_intelligent_fallback(user_input)
         duration = time.perf_counter() - start_time
         self.performance_monitor.log_response_time(duration, "fallback")
@@ -673,13 +714,19 @@ class EnhancedChatBot:
         Selects an appropriate generation configuration based on the user's input.
         This helps tailor the response style (e.g., more creative for questions).
         """
+        normalized_input = user_input.lower()
         input_length = len(user_input.split())
         
+        # Prioritize 'focused' for philosophical or abstract questions to keep them concise
+        philosophical_keywords = ['form of', 'concept of', 'meaning of', 'philosophical', 'nature of', 'implication of']
+        if any(keyword in normalized_input for keyword in philosophical_keywords):
+            return 2 # Index for 'focused' config
+
         # If the input is a question, lean towards a more creative response
-        if any(word in user_input.lower() for word in ['why', 'how', 'what', 'explain', '?']):
+        if any(word in normalized_input for word in ['why', 'how', 'what', 'explain', '?']):
             return 1  # Index for 'creative' config
         
-        # For very short inputs, a more focused/concise response might be better
+        # For very short inputs (not caught by canned responses or philosophical), a more focused/concise response might be better
         if input_length < 5:
             return 2  # Index for 'focused' config
         
@@ -744,7 +791,7 @@ class EnhancedChatBot:
         }
         
         # Determine the category of the user's input to pick a relevant fallback
-        if any(word in user_input.lower() for word in ['hello', 'hi', 'hey', 'greetings']):
+        if any(word in user_input.lower() for word in ['hello', 'hi', 'hey', 'greetings', 'how are you']):
             category = 'greeting'
         elif user_input.strip().endswith('?'):
             category = 'question'
@@ -1206,5 +1253,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
