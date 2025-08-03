@@ -1,0 +1,5 @@
+pip uninstall intel-extension-for-pytorch accelerate
+pip install accelerate
+python3 fixed_train_script.py
+
+things got updated that fixes it.
