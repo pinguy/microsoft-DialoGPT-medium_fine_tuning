@@ -3,3 +3,5 @@ pip install accelerate
 python3 fixed_train_script.py
 
 things got updated that fixes it.
+
+setup to use Deepseek 1.5b but if the model is on Huggy Face should just work with this pipeline.
