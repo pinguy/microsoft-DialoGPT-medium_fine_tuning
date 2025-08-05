@@ -22,6 +22,12 @@ import time
 import numpy as np
 import multiprocessing
 import psutil
+import random # Import random for RNG state management
+
+# PATCH START: Explicitly disable torch.compile to avoid 'torch._thread_safe_fork' error
+# This environment variable tells PyTorch to skip the compilation process.
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
+# PATCH END
 
 # CRITICAL: Force CPU-only mode by setting CUDA_VISIBLE_DEVICES BEFORE any torch imports
 # This prevents PyTorch from seeing any CUDA devices at all
@@ -263,9 +269,13 @@ def detect_optimal_device():
         torch.set_num_threads(optimal_threads)
         torch.set_num_interop_threads(optimal_threads)
         
-        # Enable CPU optimizations
-        if hasattr(torch.backends, 'mkldnn'):
-            torch.backends.mkldnn.enabled = True
+        # PATCH START: Removed specific CPU optimization that can cause issues with torch.compile
+        # The 'mkldnn' backend can sometimes trigger internal torch.compile calls
+        # that lead to missing modules like 'torch._thread_safe_fork' when
+        # intel_extension_for_pytorch is present.
+        # if hasattr(torch.backends, 'mkldnn'):
+        #     torch.backends.mkldnn.enabled = True 
+        # PATCH END
             
         torch.set_default_tensor_type('torch.FloatTensor')
         
@@ -494,14 +504,28 @@ class TrainingLogger(TrainerCallback):
                 else:
                     self.metrics[key].append(logs[key])
     
+    def save_rng_state(self, checkpoint_dir):
+        """Saves the RNG states of torch, numpy, and random."""
+        rng_state_path = Path(checkpoint_dir) / 'rng_state.pth'
+        rng_states = {
+            'torch_rng_state': torch.random.get_rng_state(),
+            'numpy_rng_state': np.random.get_state(),
+            'random_rng_state': random.getstate()
+        }
+        torch.save(rng_states, rng_state_path)
+        logger.info(f"Saved RNG states to {rng_state_path}")
+
     def on_save(self, args, state, control, model=None, **kwargs):
         """Called when model checkpoint is saved"""
         checkpoint_dir = self.output_dir / f"checkpoint-{state.global_step}"
         self.save_metrics_and_plots(checkpoint_dir)
+        self.save_rng_state(checkpoint_dir) # Save RNG state with checkpoint
         
     def on_train_end(self, args, state, control, model=None, **kwargs):
         """Called at the end of training"""
         self.save_metrics_and_plots(self.output_dir, final=True)
+        # It's good practice to save the final RNG state as well
+        self.save_rng_state(self.output_dir) 
         
     def save_metrics_and_plots(self, save_dir, final=False):
         """Save metrics JSON and generate plots"""
@@ -745,6 +769,18 @@ class CustomDataCollator:
             "labels": input_ids.clone() # For causal LMs, labels are typically the same as input_ids
         }
 
+# Function for DataLoader worker seeding
+def seed_worker(worker_id):
+    """
+    Ensures that each DataLoader worker has a unique and deterministic seed
+    based on the main process's torch seed and the worker ID.
+    This helps prevent data shuffling issues when num_workers > 0.
+    """
+    worker_seed = torch.initial_seed() % 2**32 + worker_id
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+    # logger.debug(f"Worker {worker_id} seeded with {worker_seed}") # Uncomment for debugging
+
 class DialoGPTTrainer:
     """
     A wrapper class for fine-tuning DialoGPT (or similar Causal LMs) using
@@ -954,6 +990,18 @@ class DialoGPTTrainer:
             # Step 3: Configure training arguments
             self.print_section("Training Configuration", "⚙️")
             has_validation = "validation" in tokenized_dataset
+            
+            # --- DataLoader worker seeding setup ---
+            # Define worker_init_fn here to be passed to TrainingArguments
+            # This ensures each DataLoader worker gets a unique seed for reproducibility
+            # when num_workers > 0.
+            if training_kwargs.get("dataloader_num_workers", 0) > 0:
+                logger.info(f"Configuring DataLoader with worker_init_fn for {training_kwargs.get('dataloader_num_workers')} workers.")
+                training_kwargs['dataloader_worker_init_fn'] = seed_worker
+            else:
+                logger.info("DataLoader num_workers is 0, worker_init_fn not applied.")
+            # --- End DataLoader worker seeding setup ---
+
             training_args = self.create_training_args(
                 output_dir=output_dir,
                 has_validation=has_validation,
@@ -993,14 +1041,51 @@ class DialoGPTTrainer:
             
             # Step 6: Check for existing checkpoints to resume training
             checkpoint_dir_path = Path(output_dir)
-            last_checkpoint = self.find_last_checkpoint(checkpoint_dir_path)
+            last_checkpoint_path = self.find_last_checkpoint(checkpoint_dir_path)
             
             # Step 7: Start training
             self.print_section("Training Progress", "🚀")
             
-            if last_checkpoint:
-                logger.info(f"🔄 Resuming training from existing checkpoint: {last_checkpoint}")
-                trainer.train(resume_from_checkpoint=last_checkpoint)
+            if last_checkpoint_path:
+                logger.info(f"🔄 Resuming training from existing checkpoint: {last_checkpoint_path}")
+                
+                # --- RNG State Restoration ---
+                rng_state_path = Path(last_checkpoint_path) / 'rng_state.pth'
+                if rng_state_path.exists():
+                    logger.info(f"Loading custom RNG states from {rng_state_path}...")
+                    try:
+                        rng_states = torch.load(rng_state_path)
+                        torch.random.set_rng_state(rng_states['torch_rng_state'])
+                        np.random.set_state(rng_states['numpy_rng_state'])
+                        random.setstate(rng_states['random_rng_state'])
+                        logger.info("Successfully restored torch, numpy, and random RNG states.")
+                    except Exception as e:
+                        logger.warning(f"Failed to load custom RNG states: {e}. Training might not be fully deterministic.")
+                else:
+                    logger.warning(f"Custom RNG state file not found at {rng_state_path}. Resuming without full RNG state restoration.")
+                # --- End RNG State Restoration ---
+
+                # Use resume_from_checkpoint=True to let Trainer auto-detect and load its internal state
+                trainer.train(resume_from_checkpoint=True) 
+
+                # --- Diagnostic Output after resume ---
+                if trainer.state.global_step > 0:
+                    logger.info(f"✅ Resumed at global step: {trainer.state.global_step}")
+                    # Accessing current LR from optimizer (assuming it's set up)
+                    if trainer.optimizer and hasattr(trainer.optimizer, 'param_groups') and trainer.optimizer.param_groups:
+                        current_lr = trainer.optimizer.param_groups[0]['lr']
+                        logger.info(f"✅ Current learning rate after resume: {current_lr}")
+                    else:
+                        logger.info("Could not retrieve current learning rate from optimizer for diagnostic.")
+                    # Check for optimizer state (simple check)
+                    if trainer.optimizer and trainer.optimizer.state:
+                        logger.info(f"✅ Optimizer state appears to be loaded (contains {len(trainer.optimizer.state)} entries).")
+                    else:
+                        logger.warning("Optimizer state might not be fully loaded or is empty.")
+                else:
+                    logger.warning("Trainer's global step is 0 after resume attempt. Resume might have failed.")
+                # --- End Diagnostic Output ---
+
             else:
                 logger.info("🎯 Starting fresh training run...")
                 trainer.train()
@@ -1077,6 +1162,8 @@ def main():
             warmup_steps=100,
             logging_steps=30,
             save_steps=150,
+            # Added for DataLoader worker seeding:
+            dataloader_num_workers=0, # Set to >0 if you want to use multiprocessing for data loading
         )
         
         if result:
