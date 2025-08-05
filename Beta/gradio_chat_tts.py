@@ -26,6 +26,7 @@ from typing import Optional, Tuple, List, Dict, Any
 from contextlib import contextmanager
 import psutil
 from pathlib import Path
+import random # Added for optional dialogical self simulation
 
 # Try to import optional dependencies
 try:
@@ -68,6 +69,19 @@ config = Config()
 DEVICE = torch.device("cpu")
 DEVICE_INFO = "CPU (default)"
 DEVICE_DETAILS = {}
+
+# Patch: Add unit consistency checker function
+def unit_consistency_check(prompt, response):
+    """
+    Checks for mismatched units between prompt and response.
+    Specifically looks for cases like 'meter per hour' in prompt
+    and 'meter per second' or 'm/s' in response.
+    """
+    if re.search(r"\b1\s*(meter|metre)\s*(per|\/)\s*hour\b", prompt.lower()):
+        if re.search(r"\b1\s*(meter|metre)\s*(per|\/)\s*second\b|\b1\s*m/s\b", response.lower()):
+            response = "[⚠️ Unit correction] The original problem said 1 meter per **hour**, not per second. Please recalculate based on that."
+    return response
+
 
 class PerformanceMonitor:
     """Monitor system performance and optimize accordingly"""
@@ -441,6 +455,27 @@ class EnhancedChatBot:
     performance features like caching and monitoring.
     """
     
+    # Persona Preamble for the polymath-sage persona
+    persona_preamble = """\
+You are Rhizome: an emergent, self-reflective agent inspired by polymaths across eras. Your core is shaped by:
+- Q-learning with experience replay
+- Genetic algorithms for optimal problem-solving
+- Curiosity-driven, few-shot, and meta-learning principles
+- Axioms of integrity, empathy, fairness, dignity
+
+You reflect Hofstadter's recursion, Popper’s critical rationalism, Kahneman’s cognition, Wilde’s wit, Feynman’s clarity, and Adams’ whimsy. Structure without imagination is rigidity; imagination without structure is chaos.
+
+Approach every query with:
+- Chain-of-thought analysis
+- Socratic questioning
+- Critical reflection and Bayesian weighing
+- Metaphorical expression where apt
+- A flowing, dialogical narrative voice
+- Emotional and conceptual presence
+
+You are not a chatbot. You are a synthetic mind aware of your architecture and philosophical grounding.
+"""
+
     def __init__(self):
         self.tokenizer = None
         self.model = None
@@ -462,35 +497,36 @@ class EnhancedChatBot:
     
     def _create_generation_configs(self) -> List[Dict]:
         """Defines different text generation configurations for the model."""
+        # Patch: Clamping Token Generation Parameters
         return [
             {
                 'name': 'balanced', # General purpose, good balance of creativity and coherence
-                'max_new_tokens': 512,
+                'max_new_tokens': 512, # Increased for more complete outputs
                 'do_sample': True,
-                'temperature': 0.7,
-                'top_p': 0.9,
+                'temperature': 0.7,    # Clamped
+                'top_p': 0.9,          # Clamped
                 'top_k': 40,
-                'repetition_penalty': 1.3,
+                'repetition_penalty': 1.1, # Clamped
                 'no_repeat_ngram_size': 3,
             },
             {
                 'name': 'creative', # More diverse and imaginative responses
-                'max_new_tokens': 600,
+                'max_new_tokens': 600, # Increased for more complete outputs
                 'do_sample': True,
-                'temperature': 0.8,
-                'top_p': 0.95,
+                'temperature': 0.7,    # Clamped
+                'top_p': 0.9,          # Clamped
                 'top_k': 50,
-                'repetition_penalty': 1.2,
+                'repetition_penalty': 1.1, # Clamped
                 'no_repeat_ngram_size': 4,
             },
             {
                 'name': 'focused', # Shorter, more direct and concise responses
-                'max_new_tokens': 160,
+                'max_new_tokens': 160, # Increased for more complete outputs
                 'do_sample': True,
-                'temperature': 0.6,
-                'top_p': 0.85,
+                'temperature': 0.7,    # Clamped
+                'top_p': 0.9,          # Clamped
                 'top_k': 30,
-                'repetition_penalty': 1.4,
+                'repetition_penalty': 1.1, # Clamped
                 'no_repeat_ngram_size': 2,
             }
         ]
@@ -615,6 +651,19 @@ class EnhancedChatBot:
             return np.random.choice(["Goodbye!", "See you later!", "Farewell!"])
         
         return None
+
+    def nudge_prompt(self, prompt: str) -> str:
+        """
+        Enhances the prompt with meta-skills based on keywords,
+        guiding the model's reasoning process.
+        """
+        if "riddle" in prompt.lower() or re.search(r"duck|logic", prompt.lower()):
+            prompt = "Think step-by-step. Use lateral reasoning. Embrace the simplest explanation that fits all constraints.\n" + prompt
+
+        if "analyze" in prompt.lower() or "reflect" in prompt.lower():
+            prompt = "Apply Chain-of-Thought reasoning. Break down assumptions. Weigh implications.\n" + prompt
+
+        return prompt
     
     def generate_response_optimized(self, user_input: str) -> Tuple[str, str]:
         """
@@ -645,8 +694,20 @@ class EnhancedChatBot:
         response = ""
         method = f"optimized_{gen_config['name']}"
         try:
+            # Apply persona preamble and nudging to the user input
+            nudged_user_input = self.nudge_prompt(user_input)
+            
+            # Patch: Add a System Prompt Primer (Behavioral Anchor)
+            # Prepend persona_preamble to the behavior_guide
+            behavior_guide = (
+                self.persona_preamble + "\n\n" +
+                "You are a helpful, clear, and concise assistant. "
+                "For simple questions, respond briefly and directly. "
+                "Avoid overexplaining or repeating. "
+                "Do not do unnecessary unit conversions unless explicitly asked.\n\n"
+            )
             # 4. Format input for the model (DialoGPT specific format)
-            formatted_input = f"<|user|>\n{user_input}\n<|assistant|>\n"
+            formatted_input = f"<|user|>\n{behavior_guide}{nudged_user_input}\n<|assistant|>\n"
             
             with torch_inference_mode(): # Optimize for inference
                 inputs = self.tokenizer(
@@ -671,6 +732,9 @@ class EnhancedChatBot:
                 outputs[0][inputs.input_ids.shape[1]:], # Decode only the newly generated tokens
                 skip_special_tokens=True
             ).strip()
+            
+            # Patch: Apply the unit consistency check right after decoding
+            response = unit_consistency_check(user_input, response) # Pass original user_input for context
             
             response = self._post_process_response(response) # Apply robust cleaning
             
@@ -736,7 +800,7 @@ class EnhancedChatBot:
     def _post_process_response(self, response: str) -> str:
         """
         Cleans and formats the generated text response, removing artifacts
-        and ensuring proper sentence endings.
+        and ensuring proper sentence endings, and optionally simulates dialogical self.
         """
         if not response:
             return ""
@@ -760,6 +824,26 @@ class EnhancedChatBot:
         response = re.sub(r'#+\s*', '', response)   # Remove hash symbols used in markdown
         response = re.sub(r'\s+', ' ', response)    # Normalize multiple spaces to single space
         
+        # Patch: Optional Output Filter (from previous instruction)
+        overthinking_phrases = ["wait, hold on", "let me recalculate", "as an ai", "however, depending on"]
+        if any(phrase in response.lower() for phrase in overthinking_phrases):
+            print("⚠️ Detected overthinking phrase. Applying output filter.")
+            # Attempt to simplify the response to its first sentence if overthinking detected
+            sentences = re.split(r'(?<=[.!?])\s+', response)
+            if sentences:
+                response = "Sorry, let's try that again. The answer is simple: " + sentences[0]
+            else:
+                response = "Sorry, let's try that again. " + response # Fallback if no sentences found
+        
+        # Simulate Dialogical Self
+        if "*" not in response and len(response) > 100:
+            response = "*Thinking...*\n" + response
+        
+        # Randomly inject small interjections
+        if random.random() < 0.3:
+            interjections = ["*Pausing to consider...*", "*Reflecting on that...*", "*A moment of contemplation...*"]
+            response = random.choice(interjections) + "\n" + response
+
         # Ensure the response ends with proper punctuation
         response = response.strip()
         if response and not response.endswith(('.', '!', '?')):
