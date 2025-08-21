@@ -154,6 +154,10 @@ python3 chat.py
 
 ---
 
+My weights from chats: https://huggingface.co/datasets/Pinguy1982/Rhizome/tree/main
+
+---
+
 ## 📄 License
 
 This project is licensed under the WTFPL – *Do What the Fuck You Want to Public License*.
