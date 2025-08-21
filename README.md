@@ -154,7 +154,7 @@ python3 chat.py
 
 ---
 
-My weights from chats: https://huggingface.co/datasets/Pinguy1982/Rhizome/tree/main
+My weights from chats: https://huggingface.co/datasets/Pinguy1982/Rhizome/tree/main/dialogpt-finetuned
 
 ---
 
