@@ -9,6 +9,7 @@ Key improvements:
 - **Caching**: Query result caching for repeated searches
 - **Analytics**: Search statistics and timing info
 - **Enhanced REPL**: Command history, tab completion, better UX
+- **Metadata Features**: Quality-based filtering, conversation context, temporal analysis, and more.
 
 Examples:
   # Fuzzy search with 2-character tolerance
@@ -17,11 +18,11 @@ Examples:
   # Export results to JSON
   python memory_search_enhanced.py memory.jsonl.gz --query "machine learning" --export results.json
 
-  # Performance mode for large files
-  python memory_search_enhanced.py memory.jsonl.gz --query "AI" --fast --progress
+  # Filter by quality score and sort by it
+  python memory_search_enhanced.py memory.jsonl.gz --query "AI" --min-quality 0.8 --sort quality
 
   # Advanced analytics
-  python memory_search_enhanced.py memory.jsonl.gz --stats --author "claude"
+  python memory_search_enhanced.py memory.jsonl.gz --stats --author "assistant"
 """
 
 from __future__ import annotations
@@ -46,6 +47,72 @@ try:
     HAS_READLINE = True
 except ImportError:
     HAS_READLINE = False
+
+# ---------- New Metadata-aware Functions ----------
+
+def get_conversation_context(rec: Record, all_records: List[Record], window: int = 2) -> List[Record]:
+    """Retrieve surrounding messages from the same conversation."""
+    conv_id = get_in(rec.raw, 'source_metadata.user_msg.conversation_id')
+    if not conv_id:
+        # Fallback for other possible locations
+        conv_id = get_in(rec.raw, 'source_metadata.assistant_msg.conversation_id') or \
+                  get_in(rec.raw, 'metadata.conversation_id')
+
+    if not conv_id:
+        return []
+    
+    # Find messages from same conversation near this timestamp
+    context = []
+    rec_ts = rec.timestamp or 0
+
+    for r in all_records:
+        r_conv_id = get_in(r.raw, 'source_metadata.user_msg.conversation_id') or \
+                    get_in(r.raw, 'source_metadata.assistant_msg.conversation_id') or \
+                    get_in(r.raw, 'metadata.conversation_id')
+        
+        if r_conv_id == conv_id:
+            # Check if within N hours window
+            if abs((r.timestamp or 0) - rec_ts) < window * 3600:
+                context.append(r)
+    
+    return sorted(context, key=lambda x: x.timestamp or 0)
+
+def analyze_temporal_patterns(results: List[SearchResult]) -> Dict[str, Any]:
+    """Analyze when/how often topics appear."""
+    timestamps = [r.record.timestamp for r in results if r.record.timestamp]
+    if not timestamps:
+        return {}
+    
+    # Group by hour of day, day of week, month, etc.
+    hours = Counter(datetime.fromtimestamp(ts).hour for ts in timestamps)
+    days = Counter(datetime.fromtimestamp(ts).strftime('%A') for ts in timestamps)
+    months = Counter(datetime.fromtimestamp(ts).strftime('%Y-%m') for ts in timestamps)
+    
+    return {
+        'peak_hours': hours.most_common(3),
+        'peak_days': days.most_common(3),
+        'monthly_distribution': dict(sorted(months.items())),
+        'time_span_days': (max(timestamps) - min(timestamps)) / 86400 if len(timestamps) > 1 else 0
+    }
+
+def dedupe_by_similarity(results: List[SearchResult], threshold: float = 0.9) -> List[SearchResult]:
+    """Remove near-duplicate results using semantic similarity scores."""
+    unique = []
+    seen_texts = []
+    
+    for result in results:
+        is_dup = False
+        for prev_text in seen_texts:
+            if SequenceMatcher(None, result.record.text, prev_text).ratio() > threshold:
+                is_dup = True
+                break
+        
+        if not is_dup:
+            unique.append(result)
+            seen_texts.append(result.record.text)
+    
+    return unique
+
 
 # ---------- Enhanced Utils ----------
 
@@ -276,7 +343,11 @@ class SearchOptions:
     export_format: Optional[str] = None
     highlight_style: str = 'ansi'  # ansi, html, markdown, none
     deduplicate: bool = False
-    sort_by: Optional[str] = None  # score, timestamp, idx
+    quality_min: Optional[float] = None
+    quality_max: Optional[float] = None
+    sort_by: Optional[str] = None  # score, timestamp, idx, quality
+    dedupe_method: str = 'hash' # 'hash' or 'semantic'
+    dedupe_threshold: float = 0.9
     reverse_sort: bool = False
 
 # Color and highlighting schemes
@@ -572,6 +643,20 @@ def passes_filters(rec: Record, opts: SearchOptions) -> bool:
             v = get_in(rec.raw, w.field)
             if not w.test(v):
                 return False
+    
+    if opts.quality_min is not None or opts.quality_max is not None:
+        quality_score = get_in(rec.raw, 'quality_metrics.quality_score')
+        if quality_score is None:
+            return False # If filtering by quality, records without it are excluded
+        try:
+            score = float(quality_score)
+            if opts.quality_min is not None and score < opts.quality_min:
+                return False
+            if opts.quality_max is not None and score > opts.quality_max:
+                return False
+        except (ValueError, TypeError):
+            return False
+            
     return True
 
 # ---------- Index Parsing ----------
@@ -682,6 +767,8 @@ class EnhancedREPL:
         self.opts = SearchOptions(where=[], print_fields=None)
         self.history: List[str] = []
         self.stats = SearchStats()
+        self.last_results: List[SearchResult] = []
+        self.all_records_cache: Optional[List[Record]] = None
         
         if HAS_READLINE:
             readline.set_completer(self.completer)
@@ -691,7 +778,8 @@ class EnhancedREPL:
         """Tab completion for REPL commands."""
         commands = [
             ':n', ':m', ':f', ':from', ':to', ':S', ':R', ':where', ':full',
-            ':print', ':idx', ':around', ':fuzzy', ':export', ':stats', ':help', ':q'
+            ':print', ':idx', ':around', ':fuzzy', ':export', ':stats', ':help', ':q',
+            ':quality', ':context', ':temporal', ':analyze', ':dedupe_semantic'
         ]
         matches = [cmd for cmd in commands if cmd.startswith(text)]
         return matches[state] if state < len(matches) else None
@@ -717,7 +805,12 @@ Enhanced Memory Search Commands:
   :progress        - Toggle progress display
   :highlight <style> - Set highlight style (ansi/html/markdown/none)
   :dedupe          - Toggle deduplication
-  :sort <field>    - Sort results (score/timestamp/idx)
+  :sort <field>    - Sort results (score/timestamp/idx/quality)
+  :quality <min-max> - Filter by quality_score (e.g., 0.7-0.9)
+  :context <idx>   - Show conversation context for a result index
+  :temporal        - Show temporal analysis of last search results
+  :analyze         - Show domain/author analytics of last results
+  :dedupe_semantic <thresh> - Set semantic deduplication threshold (0.0-1.0)
   :help            - Show this help
   :q               - Quit
         """
@@ -881,10 +974,13 @@ Enhanced Memory Search Commands:
         
         elif cmd == ':dedupe':
             self.opts.deduplicate = not self.opts.deduplicate
-            print(f'deduplication = {self.opts.deduplicate}')
+            if self.opts.deduplicate:
+                print(f'Deduplication enabled (method: {self.opts.dedupe_method})')
+            else:
+                print(f'Deduplication disabled')
         
         elif cmd == ':sort':
-            if arg in ('score', 'timestamp', 'idx', 'clear'):
+            if arg in ('score', 'timestamp', 'idx', 'quality', 'clear'):
                 if arg == 'clear':
                     self.opts.sort_by = None
                     print('sorting cleared')
@@ -892,8 +988,112 @@ Enhanced Memory Search Commands:
                     self.opts.sort_by = arg
                     print(f'sort by = {arg}')
             else:
-                print('Usage: :sort score|timestamp|idx|clear')
+                print('Usage: :sort score|timestamp|idx|quality|clear')
+
+        elif cmd == ':quality':
+            if '-' in arg:
+                try:
+                    min_q, max_q = map(float, arg.split('-'))
+                    self.opts.quality_min = min_q
+                    self.opts.quality_max = max_q
+                    print(f'Quality filter set: {min_q:.2f} - {max_q:.2f}')
+                except ValueError:
+                    print('Usage: :quality 0.7-0.9')
+            elif arg == 'clear':
+                self.opts.quality_min = None
+                self.opts.quality_max = None
+                print('Quality filter cleared.')
+            else:
+                print('Usage: :quality 0.7-0.9 or :quality clear')
+
+        elif cmd == ':context':
+            if not self.last_results:
+                print("Perform a search first to get results.")
+                return
+            try:
+                res_idx = int(arg)
+                target_result = next((r for r in self.last_results if r.record.idx == res_idx), None)
+                if not target_result:
+                    print(f"Result with index #{res_idx} not in last search.")
+                    return
+
+                print(f"Retrieving context for record #{res_idx}...")
+                
+                if self.all_records_cache is None:
+                    print("Caching all records (first time)...")
+                    self.all_records_cache = list(iter_memory_fast(self.path, self.opts.show_progress))
+                
+                context_records = get_conversation_context(target_result.record, self.all_records_cache)
+                
+                if not context_records:
+                    print("No conversation context found.")
+                    return
+
+                print("\n--- Conversation Context ---")
+                for rec in context_records:
+                    is_target = " <<< " if rec.idx == target_result.record.idx else ""
+                    ts = f" @ {datetime.fromtimestamp(rec.timestamp)}" if rec.timestamp else ''
+                    print(f'- #{rec.idx}{ts}{is_target}')
+                    print(f"  {squeeze_whitespace(rec.text)[:200]}...")
+                print("--- End Context ---")
+
+            except (ValueError, IndexError):
+                print("Usage: :context <result_index>")
         
+        elif cmd == ':temporal':
+            if not self.last_results:
+                print("Perform a search first.")
+                return
+            analysis = analyze_temporal_patterns(self.last_results)
+            print("\nTemporal Analysis of Last Search:")
+            print(json.dumps(analysis, indent=2))
+        
+        elif cmd == ':analyze':
+            if not self.last_results:
+                print("Perform a search first.")
+                return
+            
+            domains = Counter()
+            authors = Counter()
+            avg_quality_by_domain = defaultdict(list)
+            
+            for result in self.last_results:
+                domain = get_in(result.record.raw, 'source_metadata.domain')
+                author = get_in(result.record.raw, 'source_metadata.assistant_msg.author') or \
+                         get_in(result.record.raw, 'source_metadata.user_msg.author') or \
+                         get_in(result.record.raw, 'metadata.author')
+                quality = get_in(result.record.raw, 'quality_metrics.quality_score')
+                
+                if domain:
+                    domains[domain] += 1
+                    if quality is not None:
+                        try:
+                            avg_quality_by_domain[domain].append(float(quality))
+                        except (ValueError, TypeError):
+                            pass
+                if author:
+                    authors[author] += 1
+            
+            print("\n--- Analytics from Last Search ---")
+            print("\nTop Domains:", domains.most_common(5))
+            print("Top Authors:", authors.most_common(5))
+            print("\nAverage Quality by Domain:")
+            for domain, scores in avg_quality_by_domain.items():
+                if scores:
+                    print(f"- {domain}: {sum(scores)/len(scores):.2f} (from {len(scores)} records)")
+            print("--- End Analytics ---")
+
+        elif cmd == ':dedupe_semantic':
+            self.opts.dedupe_method = 'semantic'
+            if arg:
+                try:
+                    self.opts.dedupe_threshold = float(arg)
+                    print(f"Semantic deduplication enabled with threshold {self.opts.dedupe_threshold}")
+                except ValueError:
+                    print("Usage: :dedupe_semantic 0.9")
+            else:
+                 print(f"Semantic deduplication enabled with default threshold {self.opts.dedupe_threshold}")
+
         else:
             print(f'Unknown command: {cmd}. Type :help for available commands.')
     
@@ -932,8 +1132,7 @@ Enhanced Memory Search Commands:
             
             self.stats.filtered_records += 1
             
-            # Deduplication
-            if self.opts.deduplicate:
+            if self.opts.deduplicate and self.opts.dedupe_method == 'hash':
                 if rec.text_hash in seen_hashes:
                     continue
                 seen_hashes.add(rec.text_hash)
@@ -957,22 +1156,45 @@ Enhanced Memory Search Commands:
                 if self.opts.max_matches and matches_seen >= self.opts.max_matches:
                     break
         
-        # Sort results
+        if self.opts.deduplicate and self.opts.dedupe_method == 'semantic':
+            original_count = len(results)
+            results = dedupe_by_similarity(results, self.opts.dedupe_threshold)
+            print(f"Semantic deduplication removed {original_count - len(results)} similar results.")
+        
         if self.opts.sort_by == 'score':
             results.sort(key=lambda r: r.match_score, reverse=not self.opts.reverse_sort)
         elif self.opts.sort_by == 'timestamp':
             results.sort(key=lambda r: r.record.timestamp or 0, reverse=not self.opts.reverse_sort)
         elif self.opts.sort_by == 'idx':
             results.sort(key=lambda r: r.record.idx, reverse=self.opts.reverse_sort)
+        elif self.opts.sort_by == 'quality':
+             results.sort(key=lambda r: get_in(r.record.raw, 'quality_metrics.quality_score') or 0.0, 
+                          reverse=not self.opts.reverse_sort)
         
-        # Limit results for display
+        self.last_results = results
+        
         display_results = results[:self.opts.max_results]
         
-        # Display results
         for result in display_results:
             ts = f" @ {datetime.fromtimestamp(result.record.timestamp)}" if result.record.timestamp else ''
             score_str = f" (score: {result.match_score:.2f})" if self.opts.fuzzy_search else ""
-            print(f'- #{result.record.idx}{ts}{score_str}')
+            
+            qm = result.record.raw.get('quality_metrics', {})
+            quality_score = qm.get('quality_score')
+            quality_str = f" (Quality: {quality_score:.2f})" if quality_score is not None else ""
+            
+            print(f'- #{result.record.idx}{ts}{score_str}{quality_str}')
+            
+            sim = qm.get('semantic_similarity')
+            den = qm.get('information_density')
+            wc = qm.get('word_count')
+            metrics_str = []
+            if sim is not None: metrics_str.append(f"Similarity: {sim:.2f}")
+            if den is not None: metrics_str.append(f"Density: {den:.2f}")
+            if wc is not None: metrics_str.append(f"Words: {wc}")
+            if metrics_str:
+                print(f"  [{' | '.join(metrics_str)}]")
+
             print(f'  {result.snippet}')
             
             if result.metadata:
@@ -983,13 +1205,11 @@ Enhanced Memory Search Commands:
         
         self.stats.search_time = timer.elapsed()
         
-        # Show summary
         if display_results:
             print(f'\nFound {len(results)} matches ({len(display_results)} shown) in {self.stats.search_time:.2f}s')
         else:
             print('(no matches)')
         
-        # Export if requested
         if self.opts.export_format and results:
             try:
                 export_results(results, 
@@ -999,7 +1219,6 @@ Enhanced Memory Search Commands:
             except Exception as e:
                 print(f'Export failed: {e}')
         
-        # Show statistics
         if self.opts.collect_stats:
             self.show_statistics()
     
@@ -1058,7 +1277,7 @@ def main() -> None:
     ap.add_argument('--fast', action='store_true', help='Fast mode optimizations')
     ap.add_argument('--stats', action='store_true', help='Show search statistics')
     ap.add_argument('--dedupe', action='store_true', help='Remove duplicate results')
-    ap.add_argument('--sort', choices=['score', 'timestamp', 'idx'], help='Sort results')
+    ap.add_argument('--sort', choices=['score', 'timestamp', 'idx', 'quality'], help='Sort results')
     ap.add_argument('--reverse', action='store_true', help='Reverse sort order')
     ap.add_argument('--repl', action='store_true', help='Enter interactive mode')
 
@@ -1107,6 +1326,8 @@ def main() -> None:
         deduplicate=args.dedupe,
         sort_by=args.sort,
         reverse_sort=args.reverse,
+        quality_min=args.min_quality,
+        quality_max=args.max_quality,
     )
 
     # Build where clauses
@@ -1124,10 +1345,7 @@ def main() -> None:
     if args.conversation:
         for key in ('source_metadata.user_msg.conversation_id','source_metadata.assistant_msg.conversation_id','metadata.conversation_id'):
             where_list.append(compile_where(key, '=', str(args.conversation)))
-    if args.min_quality is not None:
-        where_list.append(compile_where('quality_metrics.quality_score', '>=', str(args.min_quality)))
-    if args.max_quality is not None:
-        where_list.append(compile_where('quality_metrics.quality_score', '<=', str(args.max_quality)))
+    
     opts.where = where_list
 
     # Parse query
@@ -1154,7 +1372,6 @@ def main() -> None:
         
         stats.filtered_records += 1
         
-        # Deduplication
         if opts.deduplicate:
             if rec.text_hash in seen_hashes:
                 continue
@@ -1187,6 +1404,9 @@ def main() -> None:
         results.sort(key=lambda r: r.record.timestamp or 0, reverse=not opts.reverse_sort)
     elif opts.sort_by == 'idx':
         results.sort(key=lambda r: r.record.idx, reverse=opts.reverse_sort)
+    elif opts.sort_by == 'quality':
+        results.sort(key=lambda r: get_in(r.record.raw, 'quality_metrics.quality_score') or 0.0, 
+                     reverse=not opts.reverse_sort)
 
     # Display results
     display_results = results[:opts.max_results]
@@ -1194,7 +1414,23 @@ def main() -> None:
     for result in display_results:
         ts = f" @ {datetime.fromtimestamp(result.record.timestamp)}" if result.record.timestamp else ''
         score_str = f" (score: {result.match_score:.2f})" if opts.fuzzy_search else ""
-        print(f'- #{result.record.idx}{ts}{score_str}')
+        
+        qm = result.record.raw.get('quality_metrics', {})
+        quality_score = qm.get('quality_score')
+        quality_str = f" (Quality: {quality_score:.2f})" if quality_score is not None else ""
+        
+        print(f'- #{result.record.idx}{ts}{score_str}{quality_str}')
+        
+        sim = qm.get('semantic_similarity')
+        den = qm.get('information_density')
+        wc = qm.get('word_count')
+        metrics_str = []
+        if sim is not None: metrics_str.append(f"Similarity: {sim:.2f}")
+        if den is not None: metrics_str.append(f"Density: {den:.2f}")
+        if wc is not None: metrics_str.append(f"Words: {wc}")
+        if metrics_str:
+            print(f"  [{' | '.join(metrics_str)}]")
+
         print(f'  {result.snippet}')
         
         if result.metadata:
