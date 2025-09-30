@@ -698,44 +698,6 @@ class SearchResult:
     snippet: str
     metadata: Optional[Dict[str, Any]] = None
 
-def format_result_with_metrics(result: SearchResult, opts: SearchOptions) -> str:
-    """Formats a single search result for display, including quality metrics."""
-    lines = []
-    
-    # Header line
-    ts = f" @ {datetime.fromtimestamp(result.record.timestamp)}" if result.record.timestamp else ''
-    score_str = f" (score: {result.match_score:.2f})" if opts.fuzzy_search else ""
-    
-    qm = result.record.raw.get('quality_metrics', {})
-    quality_score = qm.get('quality_score')
-    quality_str = f" (Quality: {quality_score:.2f})" if quality_score is not None else ""
-    
-    header = f'- #{result.record.idx}{ts}{score_str}{quality_str}'
-    lines.append(header)
-    
-    # Metrics line
-    sim = qm.get('semantic_similarity')
-    den = qm.get('information_density')
-    wc = qm.get('word_count')
-    metrics_parts = []
-    if sim is not None: metrics_parts.append(f"Similarity: {sim:.2f}")
-    if den is not None: metrics_parts.append(f"Density: {den:.2f}")
-    if wc is not None: metrics_parts.append(f"Words: {wc}")
-    if metrics_parts:
-        lines.append(f"  [{' | '.join(metrics_parts)}]")
-
-    # Snippet line
-    lines.append(f'  {result.snippet}')
-    
-    # Metadata line
-    if result.metadata:
-        meta_parts = []
-        for k, v in result.metadata.items():
-            meta_parts.append(f"{k}={json.dumps(v, ensure_ascii=False)}")
-        lines.append(f'  meta: {"; ".join(meta_parts)}')
-        
-    return "\n".join(lines)
-
 def export_results(results: List[SearchResult], format_type: str, output_path: str) -> None:
     """Export search results in various formats."""
     if format_type.lower() == 'json':
@@ -1214,7 +1176,32 @@ Enhanced Memory Search Commands:
         display_results = results[:self.opts.max_results]
         
         for result in display_results:
-            print(format_result_with_metrics(result, self.opts))
+            ts = f" @ {datetime.fromtimestamp(result.record.timestamp)}" if result.record.timestamp else ''
+            score_str = f" (score: {result.match_score:.2f})" if self.opts.fuzzy_search else ""
+            
+            qm = result.record.raw.get('quality_metrics', {})
+            quality_score = qm.get('quality_score')
+            quality_str = f" (Quality: {quality_score:.2f})" if quality_score is not None else ""
+            
+            print(f'- #{result.record.idx}{ts}{score_str}{quality_str}')
+            
+            sim = qm.get('semantic_similarity')
+            den = qm.get('information_density')
+            wc = qm.get('word_count')
+            metrics_str = []
+            if sim is not None: metrics_str.append(f"Similarity: {sim:.2f}")
+            if den is not None: metrics_str.append(f"Density: {den:.2f}")
+            if wc is not None: metrics_str.append(f"Words: {wc}")
+            if metrics_str:
+                print(f"  [{' | '.join(metrics_str)}]")
+
+            print(f'  {result.snippet}')
+            
+            if result.metadata:
+                meta_parts = []
+                for k, v in result.metadata.items():
+                    meta_parts.append(f"{k}={json.dumps(v, ensure_ascii=False)}")
+                print(f'  meta: {"; ".join(meta_parts)}')
         
         self.stats.search_time = timer.elapsed()
         
@@ -1425,7 +1412,32 @@ def main() -> None:
     display_results = results[:opts.max_results]
     
     for result in display_results:
-        print(format_result_with_metrics(result, opts))
+        ts = f" @ {datetime.fromtimestamp(result.record.timestamp)}" if result.record.timestamp else ''
+        score_str = f" (score: {result.match_score:.2f})" if opts.fuzzy_search else ""
+        
+        qm = result.record.raw.get('quality_metrics', {})
+        quality_score = qm.get('quality_score')
+        quality_str = f" (Quality: {quality_score:.2f})" if quality_score is not None else ""
+        
+        print(f'- #{result.record.idx}{ts}{score_str}{quality_str}')
+        
+        sim = qm.get('semantic_similarity')
+        den = qm.get('information_density')
+        wc = qm.get('word_count')
+        metrics_str = []
+        if sim is not None: metrics_str.append(f"Similarity: {sim:.2f}")
+        if den is not None: metrics_str.append(f"Density: {den:.2f}")
+        if wc is not None: metrics_str.append(f"Words: {wc}")
+        if metrics_str:
+            print(f"  [{' | '.join(metrics_str)}]")
+
+        print(f'  {result.snippet}')
+        
+        if result.metadata:
+            meta_parts = []
+            for k, v in result.metadata.items():
+                meta_parts.append(f"{k}={json.dumps(v, ensure_ascii=False)}")
+            print(f'  meta: {"; ".join(meta_parts)}')
 
     # Show summary
     if display_results:
@@ -1453,4 +1465,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-
