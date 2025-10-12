@@ -58,6 +58,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress pdfminer font warnings
+logging.getLogger('pdfminer').setLevel(logging.ERROR)
+
 
 # ============================================================================
 # CONFIGURATION
