@@ -1,5 +1,5 @@
 """
-Production PDF → Memory → Q&A Pipeline
+Production PDF â†’ Memory â†’ Q&A Pipeline
 ======================================
 
 Optimized pipeline with parallel processing and complete PDF extraction.
@@ -372,7 +372,7 @@ class PDFProcessor:
                         self.stats['failed'] += 1
                     pbar.update(1)
         
-        logger.info(f"✓ Extracted {self.stats['successful']}/{self.stats['total_pdfs']} PDFs")
+        logger.info(f"âœ“ Extracted {self.stats['successful']}/{self.stats['total_pdfs']} PDFs")
         if self.stats['ocr_used'] > 0:
             logger.info(f"  OCR used on {self.stats['ocr_used']} scanned PDFs")
         if self.stats['failed'] > 0:
@@ -431,7 +431,7 @@ class PDFProcessor:
             word_count = len(text.split())
             char_count = len(text)
             
-            logger.info(f"[{fn}] ✓ Final: {word_count} words, {char_count} chars, {page_count} pages")
+            logger.info(f"[{fn}] âœ“ Final: {word_count} words, {char_count} chars, {page_count} pages")
             
             # Extract structure
             struct = self.sectioner.extract(path)
@@ -480,7 +480,7 @@ class PDFProcessor:
                 })
         
         self.stats['total_chunks'] = len(chunks)
-        logger.info(f"✓ Created {len(chunks)} valid chunks")
+        logger.info(f"âœ“ Created {len(chunks)} valid chunks")
         return chunks
 
 # ============================================================================
@@ -524,7 +524,7 @@ class EmbeddingStore:
             self.vectors.extend(vecs)
             self.stats['embedded'] += len(batch)
         
-        logger.info(f"✓ Embedded {self.stats['embedded']} texts")
+        logger.info(f"âœ“ Embedded {self.stats['embedded']} texts")
         return np.array(embs)
     
     def build_faiss(self, index_path: str = 'memory.index', 
@@ -536,7 +536,7 @@ class EmbeddingStore:
         
         # Save texts
         np.save(texts_path, np.array(self.texts, dtype=object))
-        logger.info(f"✓ Saved {len(self.texts)} texts to {texts_path}")
+        logger.info(f"âœ“ Saved {len(self.texts)} texts to {texts_path}")
         
         # Build FAISS index
         if not FAISS_AVAILABLE:
@@ -547,7 +547,7 @@ class EmbeddingStore:
         index = faiss.IndexFlatL2(dim)
         index.add(np.array(self.vectors).astype('float32'))
         faiss.write_index(index, index_path)
-        logger.info(f"✓ Saved FAISS index to {index_path}")
+        logger.info(f"âœ“ Saved FAISS index to {index_path}")
 
 # ============================================================================
 # SEMANTIC LABELER (lightweight TF-IDF)
@@ -863,7 +863,7 @@ class ThreadLinker:
                 r['metadata']['thread_size'] = 1
                 r['metadata']['thread_position'] = 1
         
-        logger.info(f"✓ Created {len(threads)} threads")
+        logger.info(f"âœ“ Created {len(threads)} threads")
         return records
 
 # ============================================================================
@@ -888,7 +888,7 @@ class KnowledgeBuilder:
             if h not in seen:
                 seen.add(h)
                 out.append(c)
-        logger.info(f"Deduplicated: {len(chunks)} → {len(out)}")
+        logger.info(f"Deduplicated: {len(chunks)} â†’ {len(out)}")
         return out
     
     def group_consecutive(self, chunks: List[Dict], embeddings: np.ndarray) -> Tuple[List[Dict], np.ndarray]:
@@ -935,7 +935,7 @@ class KnowledgeBuilder:
                 g_emb.append(cur_emb)
                 i = j
         
-        logger.info(f"✓ Grouped into {len(grouped)} chunks")
+        logger.info(f"âœ“ Grouped into {len(grouped)} chunks")
         return grouped, np.array(g_emb)
     
     def build(self, chunks: List[Dict]) -> Tuple[List[Dict], np.ndarray]:
@@ -975,7 +975,7 @@ class KnowledgeBuilder:
             }
             records.append(rec)
         
-        logger.info(f"✓ Created {len(records)} knowledge records")
+        logger.info(f"âœ“ Created {len(records)} knowledge records")
         return records, gemb
 
 # ============================================================================
@@ -1081,7 +1081,7 @@ class QABuilder:
                 keep_indices.append(i)
         
         if len(qa_list) != len(keep):
-            logger.info(f"Deduplicated Q&A: {len(qa_list)} → {len(keep)}")
+            logger.info(f"Deduplicated Q&A: {len(qa_list)} â†’ {len(keep)}")
         
         return keep
     
@@ -1145,7 +1145,7 @@ class QABuilder:
                         }
                     })
         
-        logger.info(f"✓ Created {len(qa)} Q&A pairs")
+        logger.info(f"âœ“ Created {len(qa)} Q&A pairs")
         qa = self._dedup_qas(qa)
         return qa
 
@@ -1160,13 +1160,13 @@ def save_jsonl(data: List[Dict], path: str, gzip_out: bool):
             for d in data:
                 f.write(json.dumps(d) + '\n')
         size_mb = os.path.getsize(path + '.gz') / (1024 * 1024)
-        logger.info(f"✓ Saved {len(data)} records → {path}.gz ({size_mb:.2f} MB)")
+        logger.info(f"âœ“ Saved {len(data)} records â†’ {path}.gz ({size_mb:.2f} MB)")
     else:
         with open(path, 'w', encoding='utf-8') as f:
             for d in data:
                 f.write(json.dumps(d) + '\n')
         size_mb = os.path.getsize(path) / (1024 * 1024)
-        logger.info(f"✓ Saved {len(data)} records → {path} ({size_mb:.2f} MB)")
+        logger.info(f"âœ“ Saved {len(data)} records â†’ {path} ({size_mb:.2f} MB)")
 
 
 def stratified_splits(items: List[Dict], split_ratio: Tuple[float, float, float]) -> Dict[str, List[Dict]]:
@@ -1211,7 +1211,7 @@ def run(cfg: Config):
     start_time = time.time()
     
     logger.info("=" * 70)
-    logger.info("PRODUCTION PDF → MEMORY → Q&A PIPELINE")
+    logger.info("PRODUCTION PDF â†’ MEMORY â†’ Q&A PIPELINE")
     logger.info("=" * 70)
     logger.info(f"PDF dir: {cfg.pdf_dir}")
     logger.info(f"Workers: {cfg.max_workers}")
@@ -1227,14 +1227,14 @@ def run(cfg: Config):
     docs = pdfp.extract_pdfs()
     
     if not docs:
-        logger.error("❌ No documents extracted. Aborting.")
+        logger.error("âŒ No documents extracted. Aborting.")
         return
     
     logger.info(f"\n[Stage 2/7] Chunking documents...")
     chunks = pdfp.chunk_documents(docs)
     
     if not chunks:
-        logger.error("❌ No chunks produced. Aborting.")
+        logger.error("âŒ No chunks produced. Aborting.")
         return
     
     # Stage 2: Create embedding store
@@ -1309,7 +1309,7 @@ def run(cfg: Config):
     
     # Semantic labeling stats
     if cfg.enable_semantic_labeling and kb.labeler:
-        logger.info("\n📊 Theme Discovery:")
+        logger.info("\nðŸ“Š Theme Discovery:")
         top = kb.labeler.discovered.most_common(15)
         for theme, count in top:
             logger.info(f"  {theme}: {count}")
@@ -1395,7 +1395,7 @@ def test_single_pdf(pdf_path: str):
                 (len(text3), "PyPDF2", text3)],
                key=lambda x: x[0])
     
-    logger.info(f"\n✓ Best method: {best[1]} with {best[0]} characters")
+    logger.info(f"\nâœ“ Best method: {best[1]} with {best[0]} characters")
     
     # Save sample output
     sample_file = "extraction_sample.txt"
@@ -1407,7 +1407,7 @@ def test_single_pdf(pdf_path: str):
         f.write("=== FULL TEXT (best method) ===\n\n")
         f.write(best[2])
     
-    logger.info(f"\n✓ Full extraction saved to: {sample_file}")
+    logger.info(f"\nâœ“ Full extraction saved to: {sample_file}")
     logger.info("=" * 70)
 
 
@@ -1418,7 +1418,7 @@ def test_single_pdf(pdf_path: str):
 def cli():
     """Command-line interface"""
     p = argparse.ArgumentParser(
-        description='Production PDF → Memory → Q&A Pipeline',
+        description='Production PDF â†’ Memory â†’ Q&A Pipeline',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
