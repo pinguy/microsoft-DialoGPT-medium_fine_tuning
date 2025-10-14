@@ -10,9 +10,11 @@ Key improvements:
 - Parallel embedding batches
 - Memory-efficient processing
 - Progress tracking throughout
+- GPU auto-detection for embeddings with --force-cpu flag
+- CLI flags for --no-qa and --debug logging
 
 Usage:
-  python pipeline.py --pdf-dir ./PDFs --workers 16 --enable-semantic-labeling
+  python merged_pipeline.py --pdf-dir ./PDFs --workers 16 --enable-semantic-labeling
 """
 
 from __future__ import annotations
@@ -57,6 +59,7 @@ except:
     FAISS_AVAILABLE = False
 
 # Logging
+# Note: level is set to INFO by default, can be overridden by --debug flag
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -100,6 +103,7 @@ class Config:
     embedding_model: str = 'all-MiniLM-L6-v2'
     embedding_dim: int = 384
     batch_size: int = 100
+    force_cpu: bool = False  # NEW: Flag to force CPU usage
     
     # Semantic
     enable_semantic_labeling: bool = False
@@ -125,6 +129,7 @@ class Config:
     split_ratio: Tuple[float, float, float] = (0.8, 0.1, 0.1)
     
     # Q&A
+    generate_qa: bool = True  # NEW: Flag to control Q&A generation
     qa_max_pairs_per_source: int = 5000
     qa_diversity_sim_threshold: float = 0.85
     qa_group_sim_threshold: float = 0.8
@@ -396,12 +401,12 @@ class PDFProcessor:
                     all_pages.append(' '.join(page_text))
                 
                 text = '\n\n'.join(all_pages)
-                logger.info(f"[{fn}] Extracted {page_count} pages: {len(text)} chars, {len(text.split())} words")
+                logger.debug(f"[{fn}] Extracted {page_count} pages: {len(text)} chars, {len(text.split())} words")
             except Exception as e:
                 logger.warning(f"[{fn}] Page-by-page failed: {e}, trying extract_text...")
                 # FALLBACK: Use extract_text if page-by-page fails
                 text = extract_text(path)
-                logger.info(f"[{fn}] Fallback extraction: {len(text)} chars")
+                logger.debug(f"[{fn}] Fallback extraction: {len(text)} chars")
             
             # OCR fallback if no text found
             if not (text or '').strip() and self.cfg.enable_ocr and OCR_AVAILABLE:
@@ -426,7 +431,7 @@ class PDFProcessor:
             word_count = len(text.split())
             char_count = len(text)
             
-            logger.info(f"[{fn}] ✓ Final: {word_count} words, {char_count} chars, {page_count} pages")
+            logger.debug(f"[{fn}] ✓ Final: {word_count} words, {char_count} chars, {page_count} pages")
             
             # Extract structure
             struct = self.sectioner.extract(path)
@@ -479,23 +484,30 @@ class PDFProcessor:
         return chunks
 
 # ============================================================================
-# EMBEDDING STORE (with parallel batching)
+# EMBEDDING STORE (with GPU auto-detection)
 # ============================================================================
 
 class EmbeddingStore:
-    """Handle embeddings with efficient batching"""
+    """Handle embeddings with efficient batching and device management"""
     
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        
+        # Auto-detect device for embeddings
+        device = 'cpu' if cfg.force_cpu or not torch.cuda.is_available() else 'cuda'
+        if cfg.force_cpu and torch.cuda.is_available():
+            logger.warning("CUDA is available but --force-cpu flag is set. Using CPU.")
+        
+        logger.info(f"Using device: {device} for embeddings")
         logger.info(f"Loading embedding model: {cfg.embedding_model}...")
-        self.model = SentenceTransformer(cfg.embedding_model)
+        self.model = SentenceTransformer(cfg.embedding_model, device=device)
         self.texts: List[str] = []
         self.vectors: List[np.ndarray] = []
         self.stats = {'embedded': 0}
     
     def embed_chunks(self, texts: List[str]) -> np.ndarray:
         """Embed with progress tracking"""
-        logger.info(f"Embedding {len(texts)} texts...")
+        logger.info(f"Embedding {len(texts)} texts on device '{self.model.device}'...")
         embs = []
         
         for i in tqdm(range(0, len(texts), self.cfg.batch_size), desc='Embedding'):
@@ -504,7 +516,8 @@ class EmbeddingStore:
                 batch,
                 convert_to_numpy=True,
                 normalize_embeddings=True,
-                show_progress_bar=False
+                show_progress_bar=False,
+                device=self.model.device  # Explicitly pass device
             )
             embs.extend(vecs)
             self.texts.extend(batch)
@@ -1205,6 +1218,7 @@ def run(cfg: Config):
     logger.info(f"OCR: {cfg.enable_ocr and OCR_AVAILABLE}")
     logger.info(f"Sections: {cfg.extract_sections}")
     logger.info(f"Semantic labeling: {cfg.enable_semantic_labeling}")
+    logger.info(f"Q&A Generation: {cfg.generate_qa}")
     logger.info("=" * 70)
     
     # Stage 1: Extract & chunk PDFs
@@ -1250,17 +1264,23 @@ def run(cfg: Config):
         if data:
             save_jsonl(data, f"{cfg.output_prefix}_knowledge_{name}.jsonl", cfg.gzip_output)
     
-    # Stage 7: Generate Q&A pairs
-    logger.info(f"\nGenerating Q&A pairs...")
-    qa_builder = QABuilder(cfg, store)
-    qa_pairs = qa_builder.build(knowledge)
-    
-    # Split and save Q&A
-    qa_splits = stratified_splits(qa_pairs, cfg.split_ratio)
-    
-    for name, data in qa_splits.items():
-        if data:
-            save_jsonl(data, f"{cfg.output_prefix}_qa_{name}.jsonl", cfg.gzip_output)
+    # Stage 7: Generate Q&A pairs (optional)
+    if cfg.generate_qa:
+        logger.info(f"\nGenerating Q&A pairs...")
+        qa_builder = QABuilder(cfg, store)
+        qa_pairs = qa_builder.build(knowledge)
+        
+        # Split and save Q&A
+        qa_splits = stratified_splits(qa_pairs, cfg.split_ratio)
+        
+        for name, data in qa_splits.items():
+            if data:
+                save_jsonl(data, f"{cfg.output_prefix}_qa_{name}.jsonl", cfg.gzip_output)
+    else:
+        logger.info("\nSkipping Q&A generation as per --no-qa flag.")
+        qa_pairs = []
+        qa_splits = {'train': [], 'validation': [], 'test': []}
+
     
     # Final statistics
     elapsed = time.time() - start_time
@@ -1278,11 +1298,13 @@ def run(cfg: Config):
     logger.info(f"  - Validation: {len(k_splits['validation'])}")
     logger.info(f"  - Test: {len(k_splits['test'])}")
     logger.info(f"Q&A pairs: {len(qa_pairs)}")
-    logger.info(f"  - Train: {len(qa_splits['train'])}")
-    logger.info(f"  - Validation: {len(qa_splits['validation'])}")
-    logger.info(f"  - Test: {len(qa_splits['test'])}")
+    if cfg.generate_qa and qa_pairs:
+        logger.info(f"  - Train: {len(qa_splits['train'])}")
+        logger.info(f"  - Validation: {len(qa_splits['validation'])}")
+        logger.info(f"  - Test: {len(qa_splits['test'])}")
     logger.info(f"\nProcessing time: {elapsed / 60:.2f} minutes")
-    logger.info(f"Average: {elapsed / pdfp.stats['successful']:.1f}s per PDF")
+    if pdfp.stats['successful'] > 0:
+      logger.info(f"Average: {elapsed / pdfp.stats['successful']:.1f}s per PDF")
     logger.info("=" * 70)
     
     # Semantic labeling stats
@@ -1401,25 +1423,31 @@ def cli():
         epilog="""
 Examples:
   # Basic usage with parallel processing
-  python pipeline.py --pdf-dir ./PDFs --workers 16
+  python merged_pipeline.py --pdf-dir ./PDFs --workers 16
   
+  # Run on CPU even if GPU is available
+  python merged_pipeline.py --pdf-dir ./PDFs --force-cpu
+  
+  # Disable Q&A generation for a faster memory-only run
+  python merged_pipeline.py --pdf-dir ./PDFs --no-qa
+
   # Full features: OCR + semantic labeling
-  python pipeline.py --pdf-dir ./PDFs --workers 16 \\
+  python merged_pipeline.py --pdf-dir ./PDFs --workers 16 \\
     --enable-ocr --enable-semantic-labeling
   
   # Fast mode: no sections, no semantic labeling
-  python pipeline.py --pdf-dir ./PDFs --workers 32 \\
+  python merged_pipeline.py --pdf-dir ./PDFs --workers 32 \\
     --no-sections --chunk-size 300
   
   # Maximum quality
-  python pipeline.py --pdf-dir ./PDFs --workers 16 \\
+  python merged_pipeline.py --pdf-dir ./PDFs --workers 16 \\
     --enable-ocr --enable-semantic-labeling \\
     --chunk-size 400 --qa-max-pairs-per-source 10000
 
 Performance tips:
   - Use --workers matching your CPU core count
+  - The script will auto-detect and use a GPU unless --force-cpu is specified
   - Disable --no-sections if not needed (faster)
-  - Larger --chunk-size = fewer but longer chunks
   - OCR is slow; only enable if you have scanned PDFs
         """
     )
@@ -1451,7 +1479,9 @@ Performance tips:
     # Embeddings
     p.add_argument('--embedding-model', default='all-MiniLM-L6-v2',
                    help='Sentence transformer model')
-    
+    p.add_argument('--force-cpu', action='store_true',
+                   help='Force CPU for embeddings even if GPU is available')
+
     # Semantic labeling
     p.add_argument('--enable-semantic-labeling', action='store_true',
                    help='Enable semantic theme labeling')
@@ -1471,6 +1501,8 @@ Performance tips:
                    help='Max characters for merged chunks')
     
     # Q&A
+    p.add_argument('--no-qa', action='store_true',
+                   help='Disable the Q&A pair generation stage')
     p.add_argument('--qa-max-pairs-per-source', type=int, default=5000,
                    help='Max Q&A pairs per source document')
     p.add_argument('--qa-diversity-sim-threshold', type=float, default=0.85,
@@ -1486,7 +1518,7 @@ Performance tips:
     p.add_argument('--seed', type=int, default=42,
                    help='Random seed for reproducibility')
     p.add_argument('--debug', action='store_true',
-                   help='Enable debug logging for troubleshooting')
+                   help='Enable debug logging (sets level from INFO to DEBUG)')
     p.add_argument('--test-pdf', type=str, default=None,
                    help='Test extraction on a single PDF file (diagnostic mode)')
     
@@ -1496,6 +1528,7 @@ Performance tips:
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
         logger.setLevel(logging.DEBUG)
+        logger.debug("Debug mode enabled.")
     
     # Diagnostic mode for single PDF
     if args.test_pdf:
@@ -1514,12 +1547,14 @@ Performance tips:
         chunk_size=args.chunk_size,
         batch_size=args.batch_size,
         embedding_model=args.embedding_model,
+        force_cpu=args.force_cpu,
         enable_semantic_labeling=args.enable_semantic_labeling,
         semantic_method=args.semantic_method,
         semantic_model=args.semantic_model,
         sim_threshold=args.sim_threshold,
         thread_sim_threshold=args.thread_threshold,
         max_merged_length=args.max_merged_length,
+        generate_qa=not args.no_qa,
         qa_max_pairs_per_source=args.qa_max_pairs_per_source,
         qa_diversity_sim_threshold=args.qa_diversity_sim_threshold,
         qa_group_sim_threshold=args.qa_group_sim_threshold,
