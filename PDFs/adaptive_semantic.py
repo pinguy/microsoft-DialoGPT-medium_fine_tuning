@@ -14,7 +14,7 @@ Key improvements:
 - CLI flags for --no-qa and --debug logging
 
 Usage:
-  python merged_pipeline.py --pdf-dir ./PDFs --workers 16 --enable-semantic-labeling
+  python3 adaptive_semantic.py --pdf-dir ./PDFs --force-cpu --enable-semantic-labeling --semantic-method tfidf --semantic-labeler-type original
 """
 
 from __future__ import annotations
@@ -112,6 +112,7 @@ class Config:
     
     # Semantic
     enable_semantic_labeling: bool = False
+    semantic_labeler_type: str = 'adaptive'  # NEW: Toggle for labeler type
     semantic_method: str = 'tfidf'
     semantic_model: str = 'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B'
     max_themes_per_chunk: int = 3
@@ -554,6 +555,180 @@ class EmbeddingStore:
         index.add(np.array(self.vectors).astype('float32'))
         faiss.write_index(index, index_path)
         logger.info(f"✓ Saved FAISS index to {index_path}")
+
+# ============================================================================
+# ORIGINAL SEMANTIC LABELER
+# ============================================================================
+
+class SemanticLabeler:
+    """Fast heuristic-based semantic labeling with proper stopword filtering"""
+    
+    # Comprehensive stopword list
+    STOPWORDS = {
+        # Common words
+        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
+        'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'be',
+        'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
+        'would', 'should', 'could', 'may', 'might', 'must', 'can', 'shall',
+        # Pronouns
+        'i', 'you', 'he', 'she', 'it', 'we', 'they', 'them', 'their', 'this',
+        'that', 'these', 'those', 'my', 'your', 'his', 'her', 'its', 'our',
+        # Transition words
+        'however', 'therefore', 'thus', 'hence', 'moreover', 'furthermore',
+        'nevertheless', 'nonetheless', 'meanwhile', 'otherwise', 'besides',
+        'also', 'too', 'either', 'neither', 'both', 'all', 'any', 'some',
+        'each', 'every', 'many', 'much', 'more', 'most', 'other', 'another',
+        'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than',
+        'too', 'very', 'just', 'now', 'then', 'there', 'here', 'where',
+        'when', 'what', 'which', 'who', 'whom', 'whose', 'why', 'how',
+        # Common verbs
+        'said', 'say', 'says', 'saying', 'get', 'got', 'getting', 'make',
+        'made', 'making', 'go', 'going', 'went', 'gone', 'take', 'took',
+        'taken', 'taking', 'see', 'saw', 'seen', 'seeing', 'come', 'came',
+        'coming', 'think', 'thought', 'thinking', 'know', 'knew', 'known',
+        'knowing', 'want', 'wanted', 'wanting', 'give', 'gave', 'given',
+        'giving', 'use', 'used', 'using', 'find', 'found', 'finding',
+        'tell', 'told', 'telling', 'ask', 'asked', 'asking', 'work',
+        'worked', 'working', 'call', 'called', 'calling', 'try', 'tried',
+        'trying', 'need', 'needed', 'needing', 'feel', 'felt', 'feeling',
+        'become', 'became', 'becoming', 'leave', 'left', 'leaving', 'put',
+        'putting', 'mean', 'meant', 'meaning', 'keep', 'kept', 'keeping',
+        'let', 'letting', 'begin', 'began', 'begun', 'beginning', 'seem',
+        'seemed', 'seeming', 'help', 'helped', 'helping', 'show', 'showed',
+        'shown', 'showing', 'hear', 'heard', 'hearing', 'play', 'played',
+        'playing', 'run', 'ran', 'running', 'move', 'moved', 'moving',
+        'like', 'liked', 'liking', 'live', 'lived', 'living', 'believe',
+        'believed', 'believing', 'hold', 'held', 'holding', 'bring',
+        'brought', 'bringing', 'happen', 'happened', 'happening', 'write',
+        'wrote', 'written', 'writing', 'sit', 'sat', 'sitting', 'stand',
+        'stood', 'standing', 'lose', 'lost', 'losing', 'pay', 'paid',
+        'paying', 'meet', 'met', 'meeting', 'include', 'included',
+        'including', 'continue', 'continued', 'continuing', 'set', 'setting',
+        'learn', 'learned', 'learning', 'change', 'changed', 'changing',
+        'lead', 'led', 'leading', 'understand', 'understood', 'understanding',
+        'watch', 'watched', 'watching', 'follow', 'followed', 'following',
+        'stop', 'stopped', 'stopping', 'create', 'created', 'creating',
+        'speak', 'spoke', 'spoken', 'speaking', 'read', 'reading', 'allow',
+        'allowed', 'allowing', 'add', 'added', 'adding', 'spend', 'spent',
+        'spending', 'grow', 'grew', 'grown', 'growing', 'open', 'opened',
+        'opening', 'walk', 'walked', 'walking', 'win', 'won', 'winning',
+        'offer', 'offered', 'offering', 'remember', 'remembered',
+        'remembering', 'love', 'loved', 'loving', 'consider', 'considered',
+        'considering', 'appear', 'appeared', 'appearing', 'buy', 'bought',
+        'buying', 'wait', 'waited', 'waiting', 'serve', 'served', 'serving',
+        'die', 'died', 'dying', 'send', 'sent', 'sending', 'expect',
+        'expected', 'expecting', 'build', 'built', 'building', 'stay',
+        'stayed', 'staying', 'fall', 'fell', 'fallen', 'falling', 'cut',
+        'cutting', 'reach', 'reached', 'reaching', 'kill', 'killed',
+        'killing', 'remain', 'remained', 'remaining', 'suggest', 'suggested',
+        'suggesting', 'raise', 'raised', 'raising', 'pass', 'passed',
+        'passing', 'sell', 'sold', 'selling', 'require', 'required',
+        'requiring', 'report', 'reported', 'reporting', 'decide', 'decided',
+        'deciding', 'pull', 'pulled', 'pulling'
+    }
+    
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.discovered = Counter()
+    
+    def label(self, text: str) -> Dict:
+        """Extract meaningful themes using improved heuristics"""
+        themes: List[str] = []
+        
+        # Method 1: Extract proper noun phrases (capitalized multi-word terms)
+        # These are likely to be domain-specific concepts
+        proper_phrases = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b', text)
+        for phrase in proper_phrases[:5]:
+            normalized = self._normalize(phrase)
+            if normalized and len(normalized) > 3 and normalized not in themes:
+                themes.append(normalized)
+        
+        # Method 2: Extract technical terms (words with specific patterns)
+        # Look for domain-specific n-grams
+        technical_patterns = [
+            r'\b([a-z]+(?:_[a-z]+)+)\b',  # snake_case terms
+            r'\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b',  # CamelCase
+            r'\b(\w+(?:-\w+){1,2})\b',  # hyphenated-terms
+        ]
+        
+        for pattern in technical_patterns:
+            matches = re.findall(pattern, text)
+            for match in matches[:3]:
+                normalized = self._normalize(match)
+                if normalized and len(normalized) > 3 and normalized not in themes:
+                    themes.append(normalized)
+        
+        # Method 3: Domain-specific keyword patterns
+        domain_patterns = {
+            r'\b(\w+\s+(?:algorithm|method|approach|technique|model|system|framework|architecture))\b': 'technical',
+            r'\b(\w+\s+(?:theory|theorem|principle|law|hypothesis|concept))\b': 'theoretical',
+            r'\b(\w+\s+(?:analysis|study|research|investigation|examination))\b': 'analytical',
+            r'\b(\w+\s+(?:process|procedure|mechanism))\b': 'process',
+        }
+        terms = []
+        for pattern in domain_patterns:
+            terms.extend(re.findall(pattern, text.lower()))
+        for term in terms:
+            normalized = self._normalize(term)
+            if normalized and len(normalized) > 3 and normalized not in themes:
+                themes.append(normalized)
+        
+        # Method 4: Extract sentence subjects
+        subjects = re.findall(r'\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)\s+(?:is|are|was|were)\b', text)
+        for subj in subjects[:3]:
+            normalized = self._normalize(subj)
+            if normalized and len(normalized) > 3 and normalized not in themes:
+                themes.append(normalized)
+        
+        # Remove duplicates and limit
+        themes = list(set(themes))[:self.cfg.max_themes_per_chunk]
+        
+        # Fallback if no themes found
+        if not themes:
+            themes = [self._classify_content_type(text)]
+        
+        # Update discovered
+        for t in themes:
+            self.discovered[t] += 1
+        
+        primary = themes[0] if themes else 'general'
+        conf = min(0.5 + 0.1 * len(themes), 0.95)
+        
+        return {
+            'themes': themes,
+            'primary_theme': primary,
+            'confidence': conf
+        }
+    
+    def _normalize(self, s: str) -> str:
+        """Normalize to snake_case and filter stopwords"""
+        s = re.sub(r'["\'{}\(\)\[\]]', '', s)
+        s = re.sub(r'[\s\-]+', '_', s.lower())
+        s = re.sub(r'[^a-z0-9_]', '', s)
+        s = re.sub(r'_+', '_', s).strip('_')
+        
+        parts = s.split('_')
+        filtered = [p for p in parts if p and p not in self.STOPWORDS and len(p) > 2]
+        
+        if not filtered:
+            return ''
+        
+        result = '_'.join(filtered)
+        
+        if len(result) < 3 or result.isdigit():
+            return ''
+        
+        return result
+    
+    def _classify_content_type(self, text: str) -> str:
+        """Fallback content classification"""
+        if len(re.findall(r'\d+', text)) > 5:
+            return 'quantitative_analysis'
+        elif any(w in text.lower() for w in ['function', 'algorithm', 'code']):
+            return 'computational_content'
+        elif any(w in text.lower() for w in ['study', 'research', 'experiment']):
+            return 'research_content'
+        return 'descriptive_content'
 
 # ============================================================================
 # ADAPTIVE SEMANTIC LABELER (replaces original SemanticLabeler)
@@ -1110,9 +1285,14 @@ class KnowledgeBuilder:
         self.embedder = embedder
         self.qual = QualityScorer(cfg)
         if cfg.enable_semantic_labeling:
-            self.labeler = AdaptiveSemanticLabeler(cfg, embedder.model)
-            if os.path.exists('semantic_memory.pkl'):
-                self.labeler.load_semantic_state('semantic_memory.pkl')
+            if cfg.semantic_labeler_type == 'adaptive':
+                self.labeler = AdaptiveSemanticLabeler(cfg, embedder.model)
+                if os.path.exists('semantic_memory.pkl'):
+                    self.labeler.load_semantic_state('semantic_memory.pkl')
+            elif cfg.semantic_labeler_type == 'original':
+                self.labeler = SemanticLabeler(cfg)
+            else:
+                raise ValueError(f"Unknown semantic labeler type: {cfg.semantic_labeler_type}")
         else:
             self.labeler = None
     
@@ -1458,7 +1638,7 @@ def run(cfg: Config):
     logger.info(f"Workers: {cfg.max_workers}")
     logger.info(f"OCR: {cfg.enable_ocr and OCR_AVAILABLE}")
     logger.info(f"Sections: {cfg.extract_sections}")
-    logger.info(f"Semantic labeling: {cfg.enable_semantic_labeling}")
+    logger.info(f"Semantic labeling: {cfg.enable_semantic_labeling} ({cfg.semantic_labeler_type})")
     logger.info(f"Q&A Generation: {cfg.generate_qa}")
     logger.info("=" * 70)
     
@@ -1487,7 +1667,7 @@ def run(cfg: Config):
     kb = KnowledgeBuilder(cfg, store)
     knowledge, k_emb = kb.build(chunks)
 
-    if cfg.enable_semantic_labeling and kb.labeler:
+    if cfg.enable_semantic_labeling and kb.labeler and cfg.semantic_labeler_type == 'adaptive':
         kb.labeler.learn_from_run()
         kb.labeler.save_semantic_state('semantic_memory.pkl')
         kb.labeler.print_semantic_summary()
@@ -1556,11 +1736,16 @@ def run(cfg: Config):
     # Semantic labeling stats
     if cfg.enable_semantic_labeling and kb.labeler:
         logger.info("\n📊 Theme Discovery:")
-        top = kb.labeler.memory.theme_counts.most_common(15)
+        if cfg.semantic_labeler_type == 'adaptive':
+            top = kb.labeler.memory.theme_counts.most_common(15)
+            total = len(kb.labeler.memory.theme_counts)
+        else:
+            top = kb.labeler.discovered.most_common(15)
+            total = len(kb.labeler.discovered)
         for theme, count in top:
             logger.info(f"  {theme}: {count}")
-        if len(kb.labeler.memory.theme_counts) > 15:
-            logger.info(f"  ... and {len(kb.labeler.memory.theme_counts) - 15} more themes")
+        if total > 15:
+            logger.info(f"  ... and {total - 15} more themes")
 
 # ============================================================================
 # DIAGNOSTIC UTILITIES
@@ -1669,24 +1854,24 @@ def cli():
         epilog="""
 Examples:
   # Basic usage with parallel processing
-  python merged_pipeline.py --pdf-dir ./PDFs --workers 16
+  python adaptive_semantic.py --pdf-dir ./PDFs --workers 16
   
   # Run on CPU even if GPU is available
-  python merged_pipeline.py --pdf-dir ./PDFs --force-cpu
+  python adaptive_semantic.py --pdf-dir ./PDFs --force-cpu
   
   # Disable Q&A generation for a faster memory-only run
-  python merged_pipeline.py --pdf-dir ./PDFs --no-qa
+  python adaptive_semantic.py --pdf-dir ./PDFs --no-qa
 
   # Full features: OCR + semantic labeling
-  python merged_pipeline.py --pdf-dir ./PDFs --workers 16 \\
+  python adaptive_semantic.py --pdf-dir ./PDFs --workers 16 \\
     --enable-ocr --enable-semantic-labeling
   
   # Fast mode: no sections, no semantic labeling
-  python merged_pipeline.py --pdf-dir ./PDFs --workers 32 \\
+  python adaptive_semantic.py --pdf-dir ./PDFs --workers 32 \\
     --no-sections --chunk-size 300
   
   # Maximum quality
-  python merged_pipeline.py --pdf-dir ./PDFs --workers 16 \\
+  python adaptive_semantic.py --pdf-dir ./PDFs --workers 16 \\
     --enable-ocr --enable-semantic-labeling \\
     --chunk-size 400 --qa-max-pairs-per-source 10000
 
@@ -1731,6 +1916,8 @@ Performance tips:
     # Semantic labeling
     p.add_argument('--enable-semantic-labeling', action='store_true',
                    help='Enable semantic theme labeling')
+    p.add_argument('--semantic-labeler-type', choices=['original', 'adaptive'], default='adaptive',
+                   help='Type of semantic labeler to use')
     p.add_argument('--semantic-method', choices=['llm', 'tfidf', 'hybrid'],
                    default='tfidf',
                    help='Semantic labeling method')
@@ -1795,6 +1982,7 @@ Performance tips:
         embedding_model=args.embedding_model,
         force_cpu=args.force_cpu,
         enable_semantic_labeling=args.enable_semantic_labeling,
+        semantic_labeler_type=args.semantic_labeler_type,
         semantic_method=args.semantic_method,
         semantic_model=args.semantic_model,
         sim_threshold=args.sim_threshold,
@@ -1814,4 +2002,3 @@ Performance tips:
 
 if __name__ == '__main__':
     cli()
-
