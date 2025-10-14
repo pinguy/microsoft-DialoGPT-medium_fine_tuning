@@ -12,7 +12,7 @@ Key improvements:
 - Progress tracking throughout
 
 Usage:
-  python merged_pipeline.py --pdf-dir ./PDFs --workers 16 --enable-semantic-labeling
+  python pipeline.py --pdf-dir ./PDFs --workers 16 --enable-semantic-labeling
 """
 
 from __future__ import annotations
@@ -541,48 +541,179 @@ class EmbeddingStore:
 # ============================================================================
 
 class SemanticLabeler:
-    """Fast heuristic-based semantic labeling"""
+    """Fast heuristic-based semantic labeling with proper stopword filtering"""
+    
+    # Comprehensive stopword list
+    STOPWORDS = {
+        # Common words
+        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
+        'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'be',
+        'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
+        'would', 'should', 'could', 'may', 'might', 'must', 'can', 'shall',
+        # Pronouns
+        'i', 'you', 'he', 'she', 'it', 'we', 'they', 'them', 'their', 'this',
+        'that', 'these', 'those', 'my', 'your', 'his', 'her', 'its', 'our',
+        # Transition words
+        'however', 'therefore', 'thus', 'hence', 'moreover', 'furthermore',
+        'nevertheless', 'nonetheless', 'meanwhile', 'otherwise', 'besides',
+        'also', 'too', 'either', 'neither', 'both', 'all', 'any', 'some',
+        'each', 'every', 'many', 'much', 'more', 'most', 'other', 'another',
+        'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than',
+        'too', 'very', 'just', 'now', 'then', 'there', 'here', 'where',
+        'when', 'what', 'which', 'who', 'whom', 'whose', 'why', 'how',
+        # Common verbs
+        'said', 'say', 'says', 'saying', 'get', 'got', 'getting', 'make',
+        'made', 'making', 'go', 'going', 'went', 'gone', 'take', 'took',
+        'taken', 'taking', 'see', 'saw', 'seen', 'seeing', 'come', 'came',
+        'coming', 'think', 'thought', 'thinking', 'know', 'knew', 'known',
+        'knowing', 'want', 'wanted', 'wanting', 'give', 'gave', 'given',
+        'giving', 'use', 'used', 'using', 'find', 'found', 'finding',
+        'tell', 'told', 'telling', 'ask', 'asked', 'asking', 'work',
+        'worked', 'working', 'call', 'called', 'calling', 'try', 'tried',
+        'trying', 'need', 'needed', 'needing', 'feel', 'felt', 'feeling',
+        'become', 'became', 'becoming', 'leave', 'left', 'leaving', 'put',
+        'putting', 'mean', 'meant', 'meaning', 'keep', 'kept', 'keeping',
+        'let', 'letting', 'begin', 'began', 'begun', 'beginning', 'seem',
+        'seemed', 'seeming', 'help', 'helped', 'helping', 'show', 'showed',
+        'shown', 'showing', 'hear', 'heard', 'hearing', 'play', 'played',
+        'playing', 'run', 'ran', 'running', 'move', 'moved', 'moving',
+        'like', 'liked', 'liking', 'live', 'lived', 'living', 'believe',
+        'believed', 'believing', 'hold', 'held', 'holding', 'bring',
+        'brought', 'bringing', 'happen', 'happened', 'happening', 'write',
+        'wrote', 'written', 'writing', 'sit', 'sat', 'sitting', 'stand',
+        'stood', 'standing', 'lose', 'lost', 'losing', 'pay', 'paid',
+        'paying', 'meet', 'met', 'meeting', 'include', 'included',
+        'including', 'continue', 'continued', 'continuing', 'set', 'setting',
+        'learn', 'learned', 'learning', 'change', 'changed', 'changing',
+        'lead', 'led', 'leading', 'understand', 'understood', 'understanding',
+        'watch', 'watched', 'watching', 'follow', 'followed', 'following',
+        'stop', 'stopped', 'stopping', 'create', 'created', 'creating',
+        'speak', 'spoke', 'spoken', 'speaking', 'read', 'reading', 'allow',
+        'allowed', 'allowing', 'add', 'added', 'adding', 'spend', 'spent',
+        'spending', 'grow', 'grew', 'grown', 'growing', 'open', 'opened',
+        'opening', 'walk', 'walked', 'walking', 'win', 'won', 'winning',
+        'offer', 'offered', 'offering', 'remember', 'remembered',
+        'remembering', 'love', 'loved', 'loving', 'consider', 'considered',
+        'considering', 'appear', 'appeared', 'appearing', 'buy', 'bought',
+        'buying', 'wait', 'waited', 'waiting', 'serve', 'served', 'serving',
+        'die', 'died', 'dying', 'send', 'sent', 'sending', 'expect',
+        'expected', 'expecting', 'build', 'built', 'building', 'stay',
+        'stayed', 'staying', 'fall', 'fell', 'fallen', 'falling', 'cut',
+        'cutting', 'reach', 'reached', 'reaching', 'kill', 'killed',
+        'killing', 'remain', 'remained', 'remaining', 'suggest', 'suggested',
+        'suggesting', 'raise', 'raised', 'raising', 'pass', 'passed',
+        'passing', 'sell', 'sold', 'selling', 'require', 'required',
+        'requiring', 'report', 'reported', 'reporting', 'decide', 'decided',
+        'deciding', 'pull', 'pulled', 'pulling'
+    }
     
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.discovered = Counter()
     
     def label(self, text: str) -> Dict:
-        """Extract themes using heuristics"""
+        """Extract meaningful themes using improved heuristics"""
         themes: List[str] = []
         
-        # Extract proper noun phrases
-        phrases = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\b', text)
-        for p in phrases[:3]:
-            theme = self._normalize(p)
-            if theme:
-                themes.append(theme)
+        # Method 1: Extract proper noun phrases (capitalized multi-word terms)
+        # These are likely to be domain-specific concepts
+        proper_phrases = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b', text)
+        for phrase in proper_phrases[:5]:
+            normalized = self._normalize(phrase)
+            if normalized and len(normalized) > 3 and normalized not in themes:
+                themes.append(normalized)
         
-        # Fallback
+        # Method 2: Extract technical terms (words with specific patterns)
+        # Look for domain-specific n-grams
+        technical_patterns = [
+            r'\b([a-z]+(?:_[a-z]+)+)\b',  # snake_case terms
+            r'\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b',  # CamelCase
+            r'\b(\w+(?:-\w+){1,2})\b',  # hyphenated-terms
+        ]
+        
+        for pattern in technical_patterns:
+            matches = re.findall(pattern, text)
+            for match in matches[:3]:
+                normalized = self._normalize(match)
+                if normalized and len(normalized) > 3 and normalized not in themes:
+                    themes.append(normalized)
+        
+        # Method 3: Domain-specific keyword patterns
+        domain_patterns = {
+            r'\b(\w+\s+(?:algorithm|method|approach|technique|model|system|framework|architecture))\b': 'technical',
+            r'\b(\w+\s+(?:theory|theorem|principle|law|hypothesis|concept))\b': 'theoretical',
+            r'\b(\w+\s+(?:analysis|study|research|investigation|examination))\b': 'analytical',
+            r'\b(\w+\s+(?:process|procedure|workflow|pipeline|mechanism))\b': 'procedural',
+            r'\b(\w+\s+(?:structure|organization|pattern|design|layout))\b': 'structural',
+        }
+        
+        for pattern, category in domain_patterns.items():
+            matches = re.findall(pattern, text.lower())
+            for match in matches[:2]:
+                normalized = self._normalize(match)
+                if normalized and len(normalized) > 3 and normalized not in themes:
+                    themes.append(normalized)
+        
+        # Method 4: Extract from sentence subjects (often key concepts)
+        # Look for patterns like "X is/are/was/were..."
+        subject_patterns = re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:is|are|was|were|has|have)\b', text)
+        for subj in subject_patterns[:3]:
+            normalized = self._normalize(subj)
+            if normalized and len(normalized) > 3 and normalized not in themes:
+                themes.append(normalized)
+        
+        # Fallback: content type classification
         if not themes:
-            if len(re.findall(r'\d+', text)) > 4:
-                themes.append('quantitative_data')
+            if len(re.findall(r'\d+', text)) > 5:
+                themes.append('quantitative_analysis')
+            elif any(word in text.lower() for word in ['function', 'variable', 'algorithm', 'code']):
+                themes.append('computational_content')
+            elif any(word in text.lower() for word in ['study', 'research', 'experiment', 'hypothesis']):
+                themes.append('research_content')
             else:
-                themes.append('general_content')
+                themes.append('descriptive_content')
         
-        # Track
+        # Limit to configured max
+        themes = themes[:self.cfg.max_themes_per_chunk]
+        
+        # Track discovered themes
         for t in themes:
             self.discovered[t] += 1
         
         return {
-            'themes': themes[:self.cfg.max_themes_per_chunk],
+            'themes': themes,
             'primary_theme': themes[0] if themes else 'general_content',
-            'confidence': 0.6 if len(themes) > 1 else 0.5,
-            'method': 'heuristic'
+            'confidence': min(0.8, 0.5 + 0.1 * len(themes)),
+            'method': 'enhanced_heuristic'
         }
     
     def _normalize(self, s: str) -> str:
-        """Normalize to snake_case"""
+        """Normalize to snake_case and filter stopwords"""
+        # Basic cleaning
         s = re.sub(r'["\'{}\(\)\[\]]', '', s)
         s = re.sub(r'[\s\-]+', '_', s.lower())
         s = re.sub(r'[^a-z0-9_]', '', s)
         s = re.sub(r'_+', '_', s).strip('_')
-        return s if len(s) > 2 else ''
+        
+        # Split into parts and filter stopwords
+        parts = s.split('_')
+        filtered_parts = [p for p in parts if p and p not in self.STOPWORDS and len(p) > 2]
+        
+        # Require at least one non-stopword
+        if not filtered_parts:
+            return ''
+        
+        result = '_'.join(filtered_parts)
+        
+        # Additional filters
+        if len(result) < 3:  # Too short
+            return ''
+        if result.isdigit():  # Just numbers
+            return ''
+        if len(filtered_parts) == 1 and len(result) < 4:  # Single short word
+            return ''
+        
+        return result
 
 # ============================================================================
 # QUALITY SCORER
@@ -1270,18 +1401,18 @@ def cli():
         epilog="""
 Examples:
   # Basic usage with parallel processing
-  python merged_pipeline.py --pdf-dir ./PDFs --workers 16
+  python pipeline.py --pdf-dir ./PDFs --workers 16
   
   # Full features: OCR + semantic labeling
-  python merged_pipeline.py --pdf-dir ./PDFs --workers 16 \\
+  python pipeline.py --pdf-dir ./PDFs --workers 16 \\
     --enable-ocr --enable-semantic-labeling
   
   # Fast mode: no sections, no semantic labeling
-  python merged_pipeline.py --pdf-dir ./PDFs --workers 32 \\
+  python pipeline.py --pdf-dir ./PDFs --workers 32 \\
     --no-sections --chunk-size 300
   
   # Maximum quality
-  python merged_pipeline.py --pdf-dir ./PDFs --workers 16 \\
+  python pipeline.py --pdf-dir ./PDFs --workers 16 \\
     --enable-ocr --enable-semantic-labeling \\
     --chunk-size 400 --qa-max-pairs-per-source 10000
 
