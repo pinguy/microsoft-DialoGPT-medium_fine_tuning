@@ -401,12 +401,12 @@ class PDFProcessor:
                     all_pages.append(' '.join(page_text))
                 
                 text = '\n\n'.join(all_pages)
-                logger.debug(f"[{fn}] Extracted {page_count} pages: {len(text)} chars, {len(text.split())} words")
+                logger.info(f"[{fn}] Extracted {page_count} pages: {len(text)} chars, {len(text.split())} words")
             except Exception as e:
                 logger.warning(f"[{fn}] Page-by-page failed: {e}, trying extract_text...")
                 # FALLBACK: Use extract_text if page-by-page fails
                 text = extract_text(path)
-                logger.debug(f"[{fn}] Fallback extraction: {len(text)} chars")
+                logger.info(f"[{fn}] Fallback extraction: {len(text)} chars")
             
             # OCR fallback if no text found
             if not (text or '').strip() and self.cfg.enable_ocr and OCR_AVAILABLE:
@@ -431,7 +431,7 @@ class PDFProcessor:
             word_count = len(text.split())
             char_count = len(text)
             
-            logger.debug(f"[{fn}] ✓ Final: {word_count} words, {char_count} chars, {page_count} pages")
+            logger.info(f"[{fn}] ✓ Final: {word_count} words, {char_count} chars, {page_count} pages")
             
             # Extract structure
             struct = self.sectioner.extract(path)
@@ -1568,3 +1568,4 @@ Performance tips:
 
 if __name__ == '__main__':
     cli()
+
