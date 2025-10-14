@@ -14,7 +14,7 @@ Key improvements:
 - CLI flags for --no-qa and --debug logging
 
 Usage:
-  python merged_pipeline.py --pdf-dir ./PDFs --workers 16 --enable-semantic-labeling
+  python3 merged_pipeline.py --pdf-dir ./PDFs --force-cpu --enable-semantic-labeling --semantic-method tfidf
 """
 
 from __future__ import annotations
