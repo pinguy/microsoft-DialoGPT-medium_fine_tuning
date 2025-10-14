@@ -1,8 +1,9 @@
 """
-Production PDF → Memory → Q&A Pipeline
-======================================
+Production PDF → Memory → Q&A Pipeline with Adaptive Semantics
+=============================================================
 
-Optimized pipeline with parallel processing and complete PDF extraction.
+Optimized pipeline with parallel processing, complete PDF extraction,
+and self-bootstrapping semantic learning.
 
 Key improvements:
 - ThreadPoolExecutor for parallel PDF extraction
@@ -12,9 +13,14 @@ Key improvements:
 - Progress tracking throughout
 - GPU auto-detection for embeddings with --force-cpu flag
 - CLI flags for --no-qa and --debug logging
+- ADAPTIVE SEMANTIC LEARNING: --semantic-mode [normal|adaptive]
 
 Usage:
-  python3 adaptive_semantic.py --pdf-dir ./PDFs --force-cpu --enable-semantic-labeling --semantic-method tfidf --semantic-labeler-type original
+  # Normal mode (stateless heuristics)
+  python adaptive_semantic.py --pdf-dir ./PDFs --enable-semantic-labeling
+  
+  # Adaptive mode (learns from previous runs)
+  python adaptive_semantic.py --pdf-dir ./PDFs --enable-semantic-labeling --semantic-mode adaptive
 """
 
 from __future__ import annotations
@@ -28,10 +34,12 @@ import random
 import logging
 import argparse
 import hashlib
+import pickle
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
 from collections import defaultdict, Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import numpy as np
 from tqdm import tqdm
@@ -59,7 +67,6 @@ except:
     FAISS_AVAILABLE = False
 
 # Logging
-# Note: level is set to INFO by default, can be overridden by --debug flag
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -70,11 +77,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 logging.getLogger('pdfminer').setLevel(logging.ERROR)
-
-# Additional imports for adaptive semantic labeler
-import pickle
-from pathlib import Path
-from itertools import combinations
 
 # ============================================================================
 # CONFIG
@@ -93,7 +95,7 @@ class Config:
     # Extraction
     enable_ocr: bool = False
     extract_sections: bool = True
-    extract_all_pages: bool = True  # NEW: Force full extraction
+    extract_all_pages: bool = True
     min_section_title_size: float = 12.0
     max_section_title_words: int = 15
     
@@ -108,15 +110,15 @@ class Config:
     embedding_model: str = 'all-MiniLM-L6-v2'
     embedding_dim: int = 384
     batch_size: int = 100
-    force_cpu: bool = False  # NEW: Flag to force CPU usage
+    force_cpu: bool = False
     
     # Semantic
     enable_semantic_labeling: bool = False
-    semantic_labeler_type: str = 'adaptive'  # NEW: Toggle for labeler type
+    semantic_mode: str = 'normal'  # NEW: 'normal' or 'adaptive'
+    semantic_memory_path: str = 'semantic_memory.pkl'  # NEW: persistence
     semantic_method: str = 'tfidf'
     semantic_model: str = 'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B'
     max_themes_per_chunk: int = 3
-    min_co_occurrence: int = 2  # Lowered for more clusters
     
     # Similarity
     sim_threshold: float = 0.7
@@ -136,7 +138,7 @@ class Config:
     split_ratio: Tuple[float, float, float] = (0.8, 0.1, 0.1)
     
     # Q&A
-    generate_qa: bool = True  # NEW: Flag to control Q&A generation
+    generate_qa: bool = True
     qa_max_pairs_per_source: int = 5000
     qa_diversity_sim_threshold: float = 0.85
     qa_group_sim_threshold: float = 0.8
@@ -203,7 +205,6 @@ class SectionExtractor:
         
         sections = []
         try:
-            # Extract from ALL pages (no page_numbers restriction)
             laparams = LAParams()
             page_count = 0
             
@@ -230,7 +231,6 @@ class SectionExtractor:
         except Exception as e:
             logger.warning(f"Section extraction failed: {e}")
         
-        # Try TOC extraction
         toc = self._extract_toc(pdf_path)
         
         return {
@@ -272,7 +272,6 @@ class SectionExtractor:
         """Extract table of contents"""
         toc = []
         try:
-            # Only check first 3 pages for TOC
             first_pages = extract_text(pdf_path, page_numbers=[0, 1, 2])
             lines = [l.strip() for l in first_pages.split('\n')]
             in_toc = False
@@ -283,7 +282,6 @@ class SectionExtractor:
                     continue
                 
                 if in_toc:
-                    # Match "1.2 Section Name ... 15"
                     m = re.match(r'([\d\.]+)\s+(.+?)\s+\.{2,}\s*(\d+)', line)
                     if m:
                         toc.append({
@@ -305,13 +303,11 @@ class SectionExtractor:
         if not sections:
             return None
         
-        # Direct text match
         for s in sections:
             title = s.get('title', '')
             if title and title.lower() in chunk_text.lower()[:200]:
                 return title
         
-        # Positional estimate
         ratio = chunk_pos / max(total_chunks, 1)
         best = None
         best_dist = 1e9
@@ -327,7 +323,7 @@ class SectionExtractor:
         return best
 
 # ============================================================================
-# PDF PROCESSOR (with parallel extraction)
+# PDF PROCESSOR
 # ============================================================================
 
 class PDFProcessor:
@@ -363,7 +359,6 @@ class PDFProcessor:
         paths = [os.path.join(self.cfg.pdf_dir, f) for f in files]
         docs = []
         
-        # Parallel extraction
         with ThreadPoolExecutor(max_workers=self.cfg.max_workers) as executor:
             futures = {executor.submit(self._process_single_pdf, p): p for p in paths}
             
@@ -388,12 +383,11 @@ class PDFProcessor:
         return docs
     
     def _process_single_pdf(self, path: str) -> Optional[Dict]:
-        """Process a single PDF using page-by-page extraction for completeness"""
+        """Process a single PDF"""
         fn = os.path.basename(path)
         ocr_used = False
         
         try:
-            # PRIMARY METHOD: Page-by-page extraction (most complete)
             logger.debug(f"[{fn}] Starting page-by-page extraction...")
             all_pages = []
             page_count = 0
@@ -411,11 +405,9 @@ class PDFProcessor:
                 logger.info(f"[{fn}] Extracted {page_count} pages: {len(text)} chars, {len(text.split())} words")
             except Exception as e:
                 logger.warning(f"[{fn}] Page-by-page failed: {e}, trying extract_text...")
-                # FALLBACK: Use extract_text if page-by-page fails
                 text = extract_text(path)
                 logger.info(f"[{fn}] Fallback extraction: {len(text)} chars")
             
-            # OCR fallback if no text found
             if not (text or '').strip() and self.cfg.enable_ocr and OCR_AVAILABLE:
                 logger.info(f"[{fn}] No text found, attempting OCR...")
                 try:
@@ -428,19 +420,16 @@ class PDFProcessor:
                 except Exception as e:
                     logger.error(f"[{fn}] OCR failed: {e}")
             
-            # Clean and validate
             text = clean_text(text or '')
             if not text:
                 logger.warning(f"[{fn}] No text after cleaning")
                 return None
             
-            # Count words and characters
             word_count = len(text.split())
             char_count = len(text)
             
             logger.info(f"[{fn}] ✓ Final: {word_count} words, {char_count} chars, {page_count} pages")
             
-            # Extract structure
             struct = self.sectioner.extract(path)
             if struct.get('total_sections', 0) > 0:
                 self.stats['sections_extracted'] += struct['total_sections']
@@ -491,7 +480,7 @@ class PDFProcessor:
         return chunks
 
 # ============================================================================
-# EMBEDDING STORE (with GPU auto-detection)
+# EMBEDDING STORE
 # ============================================================================
 
 class EmbeddingStore:
@@ -500,7 +489,6 @@ class EmbeddingStore:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         
-        # Auto-detect device for embeddings
         device = 'cpu' if cfg.force_cpu or not torch.cuda.is_available() else 'cuda'
         if cfg.force_cpu and torch.cuda.is_available():
             logger.warning("CUDA is available but --force-cpu flag is set. Using CPU.")
@@ -524,7 +512,7 @@ class EmbeddingStore:
                 convert_to_numpy=True,
                 normalize_embeddings=True,
                 show_progress_bar=False,
-                device=self.model.device  # Explicitly pass device
+                device=self.model.device
             )
             embs.extend(vecs)
             self.texts.extend(batch)
@@ -541,11 +529,9 @@ class EmbeddingStore:
             logger.warning("No vectors to index")
             return
         
-        # Save texts
         np.save(texts_path, np.array(self.texts, dtype=object))
         logger.info(f"✓ Saved {len(self.texts)} texts to {texts_path}")
         
-        # Build FAISS index
         if not FAISS_AVAILABLE:
             logger.warning("FAISS not available, skipping index")
             return
@@ -557,148 +543,220 @@ class EmbeddingStore:
         logger.info(f"✓ Saved FAISS index to {index_path}")
 
 # ============================================================================
-# ORIGINAL SEMANTIC LABELER
+# SEMANTIC MEMORY (for Adaptive Mode)
+# ============================================================================
+
+@dataclass
+class SemanticMemory:
+    """Persistent semantic knowledge accumulated across runs"""
+    theme_counts: Counter = field(default_factory=Counter)
+    co_occurrence: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
+    clusters: Dict[str, Set[str]] = field(default_factory=dict)
+    centroids: Dict[str, np.ndarray] = field(default_factory=dict)
+    coherence_weights: Dict[str, float] = field(default_factory=dict)
+    hierarchy: Dict[str, Set[str]] = field(default_factory=lambda: defaultdict(set))
+    generation: int = 0
+    total_chunks_processed: int = 0
+    total_themes_discovered: int = 0
+
+# ============================================================================
+# SEMANTIC LABELER (with Normal/Adaptive toggle)
 # ============================================================================
 
 class SemanticLabeler:
-    """Fast heuristic-based semantic labeling with proper stopword filtering"""
+    """
+    Semantic labeler with two modes:
+    - normal: Stateless heuristic-based labeling
+    - adaptive: Self-bootstrapping from previous runs
+    """
     
-    # Comprehensive stopword list
     STOPWORDS = {
-        # Common words
         'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
         'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'be',
         'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
         'would', 'should', 'could', 'may', 'might', 'must', 'can', 'shall',
-        # Pronouns
         'i', 'you', 'he', 'she', 'it', 'we', 'they', 'them', 'their', 'this',
         'that', 'these', 'those', 'my', 'your', 'his', 'her', 'its', 'our',
-        # Transition words
         'however', 'therefore', 'thus', 'hence', 'moreover', 'furthermore',
-        'nevertheless', 'nonetheless', 'meanwhile', 'otherwise', 'besides',
-        'also', 'too', 'either', 'neither', 'both', 'all', 'any', 'some',
-        'each', 'every', 'many', 'much', 'more', 'most', 'other', 'another',
-        'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than',
-        'too', 'very', 'just', 'now', 'then', 'there', 'here', 'where',
-        'when', 'what', 'which', 'who', 'whom', 'whose', 'why', 'how',
-        # Common verbs
-        'said', 'say', 'says', 'saying', 'get', 'got', 'getting', 'make',
-        'made', 'making', 'go', 'going', 'went', 'gone', 'take', 'took',
-        'taken', 'taking', 'see', 'saw', 'seen', 'seeing', 'come', 'came',
-        'coming', 'think', 'thought', 'thinking', 'know', 'knew', 'known',
-        'knowing', 'want', 'wanted', 'wanting', 'give', 'gave', 'given',
-        'giving', 'use', 'used', 'using', 'find', 'found', 'finding',
-        'tell', 'told', 'telling', 'ask', 'asked', 'asking', 'work',
-        'worked', 'working', 'call', 'called', 'calling', 'try', 'tried',
-        'trying', 'need', 'needed', 'needing', 'feel', 'felt', 'feeling',
-        'become', 'became', 'becoming', 'leave', 'left', 'leaving', 'put',
-        'putting', 'mean', 'meant', 'meaning', 'keep', 'kept', 'keeping',
-        'let', 'letting', 'begin', 'began', 'begun', 'beginning', 'seem',
-        'seemed', 'seeming', 'help', 'helped', 'helping', 'show', 'showed',
-        'shown', 'showing', 'hear', 'heard', 'hearing', 'play', 'played',
-        'playing', 'run', 'ran', 'running', 'move', 'moved', 'moving',
-        'like', 'liked', 'liking', 'live', 'lived', 'living', 'believe',
-        'believed', 'believing', 'hold', 'held', 'holding', 'bring',
-        'brought', 'bringing', 'happen', 'happened', 'happening', 'write',
-        'wrote', 'written', 'writing', 'sit', 'sat', 'sitting', 'stand',
-        'stood', 'standing', 'lose', 'lost', 'losing', 'pay', 'paid',
-        'paying', 'meet', 'met', 'meeting', 'include', 'included',
-        'including', 'continue', 'continued', 'continuing', 'set', 'setting',
-        'learn', 'learned', 'learning', 'change', 'changed', 'changing',
-        'lead', 'led', 'leading', 'understand', 'understood', 'understanding',
-        'watch', 'watched', 'watching', 'follow', 'followed', 'following',
-        'stop', 'stopped', 'stopping', 'create', 'created', 'creating',
-        'speak', 'spoke', 'spoken', 'speaking', 'read', 'reading', 'allow',
-        'allowed', 'allowing', 'add', 'added', 'adding', 'spend', 'spent',
-        'spending', 'grow', 'grew', 'grown', 'growing', 'open', 'opened',
-        'opening', 'walk', 'walked', 'walking', 'win', 'won', 'winning',
-        'offer', 'offered', 'offering', 'remember', 'remembered',
-        'remembering', 'love', 'loved', 'loving', 'consider', 'considered',
-        'considering', 'appear', 'appeared', 'appearing', 'buy', 'bought',
-        'buying', 'wait', 'waited', 'waiting', 'serve', 'served', 'serving',
-        'die', 'died', 'dying', 'send', 'sent', 'sending', 'expect',
-        'expected', 'expecting', 'build', 'built', 'building', 'stay',
-        'stayed', 'staying', 'fall', 'fell', 'fallen', 'falling', 'cut',
-        'cutting', 'reach', 'reached', 'reaching', 'kill', 'killed',
-        'killing', 'remain', 'remained', 'remaining', 'suggest', 'suggested',
-        'suggesting', 'raise', 'raised', 'raising', 'pass', 'passed',
-        'passing', 'sell', 'sold', 'selling', 'require', 'required',
-        'requiring', 'report', 'reported', 'reporting', 'decide', 'decided',
-        'deciding', 'pull', 'pulled', 'pulling'
+        'said', 'say', 'get', 'make', 'go', 'take', 'see', 'come', 'think',
+        'know', 'want', 'give', 'use', 'find', 'tell', 'ask', 'work', 'call',
     }
     
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, embedding_model=None):
         self.cfg = cfg
+        self.mode = cfg.semantic_mode
+        self.embedding_model = embedding_model
         self.discovered = Counter()
+        
+        # Adaptive mode state
+        if self.mode == 'adaptive':
+            self.memory = SemanticMemory()
+            self._current_run_themes = []
+            self._current_run_records = []
+            self._load_memory()
+            logger.info(f"🧠 Adaptive semantic mode: Generation {self.memory.generation}")
+        else:
+            logger.info("📝 Normal semantic mode: Stateless heuristics")
+    
+    def _load_memory(self):
+        """Load semantic memory from previous runs"""
+        path = Path(self.cfg.semantic_memory_path)
+        if path.exists():
+            try:
+                with open(path, 'rb') as f:
+                    self.memory = pickle.load(f)
+                logger.info(f"✓ Loaded semantic memory (Gen {self.memory.generation}, "
+                          f"{len(self.memory.theme_counts)} themes, "
+                          f"{self.memory.total_chunks_processed} chunks)")
+            except Exception as e:
+                logger.warning(f"Failed to load semantic memory: {e}")
+        else:
+            logger.info("No previous semantic memory found, starting fresh")
+    
+    def save_memory(self):
+        """Save semantic memory for next run"""
+        if self.mode != 'adaptive':
+            return
+        
+        self.memory.generation += 1
+        path = Path(self.cfg.semantic_memory_path)
+        with open(path, 'wb') as f:
+            pickle.dump(self.memory, f)
+        logger.info(f"✓ Saved semantic memory to {path} (Gen {self.memory.generation})")
     
     def label(self, text: str) -> Dict:
-        """Extract meaningful themes using improved heuristics"""
-        themes: List[str] = []
+        """Label text with semantic themes"""
+        if self.mode == 'adaptive':
+            return self._label_adaptive(text)
+        else:
+            return self._label_normal(text)
+    
+    def _label_normal(self, text: str) -> Dict:
+        """Normal mode: stateless heuristic labeling"""
+        themes = []
         
-        # Method 1: Extract proper noun phrases (capitalized multi-word terms)
-        # These are likely to be domain-specific concepts
-        proper_phrases = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b', text)
-        for phrase in proper_phrases[:5]:
-            normalized = self._normalize(phrase)
-            if normalized and len(normalized) > 3 and normalized not in themes:
-                themes.append(normalized)
+        # Extract candidates
+        themes.extend(self._extract_proper_phrases(text)[:5])
+        themes.extend(self._extract_technical_terms(text)[:3])
+        themes.extend(self._extract_domain_patterns(text)[:3])
+        themes.extend(self._extract_sentence_subjects(text)[:3])
         
-        # Method 2: Extract technical terms (words with specific patterns)
-        # Look for domain-specific n-grams
-        technical_patterns = [
-            r'\b([a-z]+(?:_[a-z]+)+)\b',  # snake_case terms
-            r'\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b',  # CamelCase
-            r'\b(\w+(?:-\w+){1,2})\b',  # hyphenated-terms
-        ]
+        # Normalize and filter
+        themes = [self._normalize(t) for t in themes]
+        themes = [t for t in themes if t and len(t) > 3]
+        themes = list(dict.fromkeys(themes))[:self.cfg.max_themes_per_chunk]
         
-        for pattern in technical_patterns:
-            matches = re.findall(pattern, text)
-            for match in matches[:3]:
-                normalized = self._normalize(match)
-                if normalized and len(normalized) > 3 and normalized not in themes:
-                    themes.append(normalized)
-        
-        # Method 3: Domain-specific keyword patterns
-        domain_patterns = {
-            r'\b(\w+\s+(?:algorithm|method|approach|technique|model|system|framework|architecture))\b': 'technical',
-            r'\b(\w+\s+(?:theory|theorem|principle|law|hypothesis|concept))\b': 'theoretical',
-            r'\b(\w+\s+(?:analysis|study|research|investigation|examination))\b': 'analytical',
-            r'\b(\w+\s+(?:process|procedure|mechanism))\b': 'process',
-        }
-        terms = []
-        for pattern in domain_patterns:
-            terms.extend(re.findall(pattern, text.lower()))
-        for term in terms:
-            normalized = self._normalize(term)
-            if normalized and len(normalized) > 3 and normalized not in themes:
-                themes.append(normalized)
-        
-        # Method 4: Extract sentence subjects
-        subjects = re.findall(r'\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)\s+(?:is|are|was|were)\b', text)
-        for subj in subjects[:3]:
-            normalized = self._normalize(subj)
-            if normalized and len(normalized) > 3 and normalized not in themes:
-                themes.append(normalized)
-        
-        # Remove duplicates and limit
-        themes = list(set(themes))[:self.cfg.max_themes_per_chunk]
-        
-        # Fallback if no themes found
+        # Fallback
         if not themes:
             themes = [self._classify_content_type(text)]
         
-        # Update discovered
+        # Track discovery
         for t in themes:
             self.discovered[t] += 1
         
-        primary = themes[0] if themes else 'general'
-        conf = min(0.5 + 0.1 * len(themes), 0.95)
+        return {
+            'themes': themes,
+            'primary_theme': themes[0] if themes else 'general_content',
+            'confidence': min(0.8, 0.5 + 0.1 * len(themes)),
+            'method': 'heuristic'
+        }
+    
+    def _label_adaptive(self, text: str) -> Dict:
+        """Adaptive mode: self-bootstrapping labeling"""
+        themes = []
+        raw_candidates = set()
+        
+        # Phase 1: Extract raw candidates
+        raw_candidates.update(self._extract_proper_phrases(text))
+        raw_candidates.update(self._extract_technical_terms(text))
+        raw_candidates.update(self._extract_domain_patterns(text))
+        raw_candidates.update(self._extract_sentence_subjects(text))
+        
+        # Normalize and filter
+        normalized = {self._normalize(c) for c in raw_candidates if c}
+        normalized = {n for n in normalized if n and len(n) > 3}
+        
+        # Phase 2: Apply learned reinforcement
+        if self.memory.generation > 0:
+            scored = self._apply_coherence_weights(normalized, text)
+            themes = [t for t, _ in sorted(scored, key=lambda x: x[1], reverse=True)]
+        else:
+            themes = list(normalized)
+        
+        # Phase 3: Add concept-level matches
+        if self.embedding_model and self.memory.centroids:
+            concept_matches = self._match_to_centroids(text)
+            themes.extend(concept_matches)
+        
+        # Remove duplicates, limit
+        themes = list(dict.fromkeys(themes))[:self.cfg.max_themes_per_chunk]
+        
+        # Fallback
+        if not themes:
+            themes = [self._classify_content_type(text)]
+        
+        # Record for learning
+        self._current_run_themes.append(themes)
+        self._current_run_records.append({'text': text, 'themes': themes})
+        
+        # Track discovery
+        for t in themes:
+            self.discovered[t] += 1
         
         return {
             'themes': themes,
-            'primary_theme': primary,
-            'confidence': conf
+            'primary_theme': themes[0] if themes else 'general_content',
+            'confidence': self._compute_confidence(themes, text),
+            'method': 'adaptive_bootstrap',
+            'generation': self.memory.generation
         }
+    
+    # ========================================================================
+    # Extraction Methods (shared by both modes)
+    # ========================================================================
+    
+    def _extract_proper_phrases(self, text: str) -> List[str]:
+        """Extract capitalized multi-word terms"""
+        return re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b', text)
+    
+    def _extract_technical_terms(self, text: str) -> List[str]:
+        """Extract technical patterns"""
+        patterns = [
+            r'\b([a-z]+(?:_[a-z]+)+)\b',
+            r'\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b',
+            r'\b(\w+(?:-\w+){1,2})\b',
+        ]
+        terms = []
+        for pattern in patterns:
+            terms.extend(re.findall(pattern, text))
+        return terms
+    
+    def _extract_domain_patterns(self, text: str) -> List[str]:
+        """Extract domain-specific keyword patterns"""
+        patterns = [
+            r'\b(\w+\s+(?:algorithm|method|approach|technique|model|system))\b',
+            r'\b(\w+\s+(?:theory|theorem|principle|law|concept))\b',
+            r'\b(\w+\s+(?:analysis|study|research))\b',
+            r'\b(\w+\s+(?:process|procedure|mechanism))\b',
+        ]
+        terms = []
+        for pattern in patterns:
+            terms.extend(re.findall(pattern, text.lower()))
+        return terms
+    
+    def _extract_sentence_subjects(self, text: str) -> List[str]:
+        """Extract subjects from sentences"""
+        return re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:is|are|was|were)\b', text)
+    
+    def _classify_content_type(self, text: str) -> str:
+        """Fallback content classification"""
+        if len(re.findall(r'\d+', text)) > 5:
+            return 'quantitative_analysis'
+        elif any(w in text.lower() for w in ['function', 'algorithm', 'code']):
+            return 'computational_content'
+        elif any(w in text.lower() for w in ['study', 'research', 'experiment']):
+            return 'research_content'
+        return 'descriptive_content'
     
     def _normalize(self, s: str) -> str:
         """Normalize to snake_case and filter stopwords"""
@@ -720,186 +778,9 @@ class SemanticLabeler:
         
         return result
     
-    def _classify_content_type(self, text: str) -> str:
-        """Fallback content classification"""
-        if len(re.findall(r'\d+', text)) > 5:
-            return 'quantitative_analysis'
-        elif any(w in text.lower() for w in ['function', 'algorithm', 'code']):
-            return 'computational_content'
-        elif any(w in text.lower() for w in ['study', 'research', 'experiment']):
-            return 'research_content'
-        return 'descriptive_content'
-
-# ============================================================================
-# ADAPTIVE SEMANTIC LABELER (replaces original SemanticLabeler)
-# ============================================================================
-
-@dataclass
-class SemanticMemory:
-    """Persistent semantic knowledge accumulated across runs"""
-    
-    # Theme frequency tracking
-    theme_counts: Counter = field(default_factory=Counter)
-    
-    # Co-occurrence matrix: theme -> {co-theme: count}
-    co_occurrence: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
-    
-    # Concept clusters: hierarchical groupings
-    clusters: Dict[str, Set[str]] = field(default_factory=dict)
-    
-    # Theme centroids (if embeddings available)
-    centroids: Dict[str, np.ndarray] = field(default_factory=dict)
-    
-    # Reinforcement weights learned from coherence
-    coherence_weights: Dict[str, float] = field(default_factory=dict)
-    
-    # Hierarchical relationships: parent -> children
-    hierarchy: Dict[str, Set[str]] = field(default_factory=lambda: defaultdict(set))
-    
-    # Generation counter
-    generation: int = 0
-    
-    # Statistics
-    total_chunks_processed: int = 0
-    total_themes_discovered: int = 0
-
-
-class AdaptiveSemanticLabeler:
-    """Self-bootstrapping semantic labeler"""
-    
-    # Core stopwords (expanded)
-    STOPWORDS = {
-        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
-        'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'be',
-        'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
-        'would', 'should', 'could', 'may', 'might', 'must', 'can', 'shall',
-        'i', 'you', 'he', 'she', 'it', 'we', 'they', 'them', 'their', 'this',
-        'that', 'these', 'those', 'my', 'your', 'his', 'her', 'its', 'our',
-        'however', 'therefore', 'thus', 'hence', 'moreover', 'furthermore',
-        'said', 'say', 'get', 'make', 'go', 'take', 'see', 'come', 'think',
-        'know', 'want', 'give', 'use', 'find', 'tell', 'ask', 'work', 'call',
-        'there', 'one', 'that', 'this', 'would'  # Added as per suggestion
-    }
-    
-    def __init__(self, cfg, embedding_model=None):
-        self.cfg = cfg
-        self.embedding_model = embedding_model  # Optional: for centroid-based matching
-        self.memory = SemanticMemory()
-        
-        # Temporary accumulation for current run
-        self._current_run_themes = []
-        self._current_run_records = []
-    
-    def load_semantic_state(self, path: str):
-        """Load previously learned semantic memory"""
-        path_obj = Path(path)
-        if path_obj.exists():
-            with open(path_obj, 'rb') as f:
-                self.memory = pickle.load(f)
-            logger.info(f"✓ Loaded semantic memory (Gen {self.memory.generation}, "
-                  f"{len(self.memory.theme_counts)} themes, "
-                  f"{self.memory.total_chunks_processed} chunks)")
-        else:
-            logger.info(f"⚠ No semantic memory found at {path}, starting fresh")
-    
-    def save_semantic_state(self, path: str):
-        """Save learned semantic memory for next run"""
-        self.memory.generation += 1
-        with open(path, 'wb') as f:
-            pickle.dump(self.memory, f)
-        logger.info(f"✓ Saved semantic memory to {path} (Gen {self.memory.generation})")
-    
-    def label(self, text: str) -> Dict:
-        """Label text with adaptive semantic themes"""
-        themes = []
-        raw_candidates = set()
-        
-        # Phase 1: Extract raw candidates (original heuristics)
-        raw_candidates.update(self._extract_proper_phrases(text))
-        raw_candidates.update(self._extract_technical_terms(text))
-        raw_candidates.update(self._extract_domain_patterns(text))
-        raw_candidates.update(self._extract_sentence_subjects(text))
-        
-        # Normalize and filter
-        normalized = {self._normalize(c) for c in raw_candidates if c}
-        normalized = {n for n in normalized if n and len(n) > 3}
-        
-        # Phase 2: Apply learned reinforcement
-        if self.memory.generation > 0:
-            scored = self._apply_coherence_weights(normalized, text)
-            themes = [t for t, _ in sorted(scored, key=lambda x: x[1], reverse=True)]
-        else:
-            themes = list(normalized)
-        
-        # Phase 3: Add concept-level matches (if embeddings available)
-        if self.embedding_model and self.memory.centroids:
-            concept_matches = self._match_to_centroids(text)
-            themes.extend(concept_matches)
-        
-        # Remove duplicates, limit
-        themes = list(dict.fromkeys(themes))[:self.cfg.max_themes_per_chunk]
-        
-        # Fallback
-        if not themes:
-            themes = [self._classify_content_type(text)]
-        
-        # Record for this run's learning
-        self._current_run_themes.append(themes)
-        self._current_run_records.append({
-            'text': text,
-            'themes': themes
-        })
-        
-        return {
-            'themes': themes,
-            'primary_theme': themes[0] if themes else 'general_content',
-            'confidence': self._compute_confidence(themes, text),
-            'method': 'adaptive_bootstrap',
-            'generation': self.memory.generation
-        }
-    
-    def _extract_proper_phrases(self, text: str) -> List[str]:
-        """Extract capitalized multi-word terms"""
-        return re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b', text)
-    
-    def _extract_technical_terms(self, text: str) -> List[str]:
-        """Extract technical patterns"""
-        patterns = [
-            r'\b([a-z]+(?:_[a-z]+)+)\b',
-            r'\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b',
-            r'\b(\w+(?:-\w+){1,2})\b',
-        ]
-        terms = []
-        for pattern in patterns:
-            terms.extend(re.findall(pattern, text))
-        return terms
-    
-    def _extract_domain_patterns(self, text: str) -> List[str]:
-        """Extract domain-specific keyword patterns"""
-        patterns = {
-            r'\b(\w+\s+(?:algorithm|method|approach|technique|model|system))\b': True,
-            r'\b(\w+\s+(?:theory|theorem|principle|law|concept))\b': True,
-            r'\b(\w+\s+(?:analysis|study|research))\b': True,
-            r'\b(\w+\s+(?:process|procedure|mechanism))\b': True,
-        }
-        terms = []
-        for pattern in patterns:
-            terms.extend(re.findall(pattern, text.lower()))
-        return terms
-    
-    def _extract_sentence_subjects(self, text: str) -> List[str]:
-        """Extract subjects from sentences"""
-        return re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:is|are|was|were)\b', text)
-    
-    def _classify_content_type(self, text: str) -> str:
-        """Fallback content classification"""
-        if len(re.findall(r'\d+', text)) > 5:
-            return 'quantitative_analysis'
-        elif any(w in text.lower() for w in ['function', 'algorithm', 'code']):
-            return 'computational_content'
-        elif any(w in text.lower() for w in ['study', 'research', 'experiment']):
-            return 'research_content'
-        return 'descriptive_content'
+    # ========================================================================
+    # Adaptive Mode Methods
+    # ========================================================================
     
     def _apply_coherence_weights(self, candidates: Set[str], text: str) -> List[Tuple[str, float]]:
         """Apply learned coherence weights to boost related themes"""
@@ -927,16 +808,6 @@ class AdaptiveSemanticLabeler:
             if theme in self.memory.coherence_weights:
                 base_score *= self.memory.coherence_weights[theme]
             
-            # Hybrid boost if embedding available and hybrid mode
-            if self.embedding_model and self.cfg.semantic_method in ['hybrid', 'tfidf']:
-                try:
-                    theme_emb = self.embedding_model.encode(f"The concept of {theme}")
-                    text_emb = self.embedding_model.encode(text[:500])
-                    sim = cosine_similarity([theme_emb], [text_emb])[0][0]
-                    base_score += sim * 0.3
-                except:
-                    pass
-            
             scored.append((theme, base_score))
         
         return scored
@@ -948,7 +819,7 @@ class AdaptiveSemanticLabeler:
         
         try:
             text_embedding = self.embedding_model.encode(
-                text[:500],  # Sample for speed
+                text[:500],
                 convert_to_numpy=True,
                 normalize_embeddings=True
             )
@@ -956,10 +827,10 @@ class AdaptiveSemanticLabeler:
             matches = []
             for theme, centroid in self.memory.centroids.items():
                 similarity = np.dot(text_embedding, centroid)
-                if similarity > 0.7:  # Threshold for concept match
+                if similarity > 0.7:
                     matches.append(theme)
             
-            return matches[:2]  # Top 2 concept matches
+            return matches[:2]
         except:
             return []
     
@@ -970,57 +841,34 @@ class AdaptiveSemanticLabeler:
         
         base = 0.5 + 0.1 * len(themes)
         
-        # Boost if themes have strong historical support
         if self.memory.generation > 0:
             known_themes = sum(1 for t in themes if t in self.memory.theme_counts)
             base += 0.1 * (known_themes / len(themes))
         
         return min(base, 0.95)
     
-    def _normalize(self, s: str) -> str:
-        """Normalize to snake_case and filter stopwords"""
-        s = re.sub(r'["\'{}\(\)\[\]]', '', s)
-        s = re.sub(r'[\s\-]+', '_', s.lower())
-        s = re.sub(r'[^a-z0-9_]', '', s)
-        s = re.sub(r'_+', '_', s).strip('_')
-        
-        parts = s.split('_')
-        filtered = [p for p in parts if p and p not in self.STOPWORDS and len(p) > 2]
-        
-        if not filtered:
-            return ''
-        
-        result = '_'.join(filtered)
-        
-        if len(result) < 3 or result.isdigit():
-            return ''
-        
-        return result
-    
     # ========================================================================
-    # LEARNING PHASE - Called after processing all chunks
+    # Learning Phase (Adaptive Mode Only)
     # ========================================================================
     
     def learn_from_run(self):
-        """Bootstrap semantics from current run"""
+        """Bootstrap semantics from current run (adaptive mode only)"""
+        if self.mode != 'adaptive':
+            return
+        
         if not self._current_run_records:
-            logger.info("⚠ No records to learn from")
+            logger.warning("No records to learn from")
             return
         
         logger.info(f"\n🧠 Learning from {len(self._current_run_records)} chunks...")
         
-        old_avg = np.mean(list(self.memory.coherence_weights.values())) if self.memory.coherence_weights else 0
-        old_clusters = len(self.memory.clusters)
-        
         # Phase 1: Update theme frequencies
-        num_reinforced = 0
         for themes in self._current_run_themes:
             for theme in themes:
-                if theme in self.memory.theme_counts:
-                    num_reinforced += 1
                 self.memory.theme_counts[theme] += 1
         
         # Phase 2: Build co-occurrence matrix
+        from itertools import combinations
         for themes in self._current_run_themes:
             for a, b in combinations(themes, 2):
                 self.memory.co_occurrence[a][b] += 1
@@ -1032,7 +880,7 @@ class AdaptiveSemanticLabeler:
         # Phase 4: Compute coherence weights
         self._compute_coherence_weights()
         
-        # Phase 5: Build concept centroids (if embeddings available)
+        # Phase 5: Build concept centroids
         if self.embedding_model:
             self._build_centroids()
         
@@ -1043,16 +891,9 @@ class AdaptiveSemanticLabeler:
         self.memory.total_chunks_processed += len(self._current_run_records)
         self.memory.total_themes_discovered = len(self.memory.theme_counts)
         
-        new_clusters = len(self.memory.clusters) - old_clusters
-        new_avg = np.mean(list(self.memory.coherence_weights.values()))
-        delta = new_avg - old_avg
-        
-        logger.info(f"✓ Reinforced {num_reinforced} prior weights")
         logger.info(f"✓ Learned {len(self.memory.theme_counts)} unique themes")
-        logger.info(f"✓ Created {new_clusters} new clusters")
         logger.info(f"✓ Discovered {len(self.memory.clusters)} concept clusters")
         logger.info(f"✓ Built {len(self.memory.coherence_weights)} coherence weights")
-        logger.info(f"✓ Semantic coherence improved by +{delta:.2f}")
         
         # Clear current run
         self._current_run_themes = []
@@ -1060,7 +901,6 @@ class AdaptiveSemanticLabeler:
     
     def _build_clusters(self):
         """Build concept clusters from co-occurrence patterns"""
-        # Simple clustering: group themes with strong mutual co-occurrence
         visited = set()
         cluster_id = 0
         
@@ -1068,14 +908,12 @@ class AdaptiveSemanticLabeler:
             if theme in visited:
                 continue
             
-            # Start new cluster
             cluster = {theme}
             visited.add(theme)
             
-            # Add strongly related themes
             if theme in self.memory.co_occurrence:
                 for related, count in self.memory.co_occurrence[theme].most_common(5):
-                    if count >= self.cfg.min_co_occurrence:
+                    if count >= 3:
                         cluster.add(related)
                         visited.add(related)
             
@@ -1086,15 +924,11 @@ class AdaptiveSemanticLabeler:
     def _compute_coherence_weights(self):
         """Compute reinforcement weights from coherence patterns"""
         for theme in self.memory.theme_counts:
-            # Base weight on frequency
             freq_weight = np.log1p(self.memory.theme_counts[theme]) / 10
             
-            # Adjust based on co-occurrence strength
             if theme in self.memory.co_occurrence:
                 total_co = sum(self.memory.co_occurrence[theme].values())
                 unique_partners = len(self.memory.co_occurrence[theme])
-                
-                # High co-occurrence diversity = strong concept
                 diversity_factor = unique_partners / max(total_co, 1)
                 coherence_boost = min(diversity_factor * 2, 1.0)
             else:
@@ -1110,21 +944,18 @@ class AdaptiveSemanticLabeler:
         logger.info("  Building concept centroids...")
         
         for cluster_name, themes in self.memory.clusters.items():
-            # Collect text samples for each theme
             theme_texts = defaultdict(list)
             for record in self._current_run_records:
                 for theme in record['themes']:
                     if theme in themes:
                         theme_texts[theme].append(record['text'][:200])
             
-            # Compute centroid for cluster
             embeddings = []
             for theme, texts in theme_texts.items():
                 if texts:
-                    sample = texts[0]  # Use first occurrence
                     try:
                         emb = self.embedding_model.encode(
-                            sample,
+                            texts[0],
                             convert_to_numpy=True,
                             normalize_embeddings=True
                         )
@@ -1135,16 +966,11 @@ class AdaptiveSemanticLabeler:
             if embeddings:
                 centroid = np.mean(embeddings, axis=0)
                 centroid = centroid / (np.linalg.norm(centroid) + 1e-8)
-                
-                # Store centroid for the primary theme in cluster
                 primary = max(themes, key=lambda t: self.memory.theme_counts[t])
                 self.memory.centroids[primary] = centroid
     
     def _build_hierarchy(self):
         """Build hierarchical relationships between themes"""
-        # Simple heuristic: if theme A always co-occurs with theme B,
-        # but B appears in many other contexts, B is likely more general
-        
         for theme in self.memory.theme_counts:
             if theme not in self.memory.co_occurrence:
                 continue
@@ -1154,167 +980,210 @@ class AdaptiveSemanticLabeler:
             for related, co_count in self.memory.co_occurrence[theme].items():
                 related_count = self.memory.theme_counts[related]
                 
-                # If theme almost always appears with related, but related is more common
-                # Then related is likely a parent concept
                 if co_count / theme_count > 0.7 and related_count > theme_count * 2:
                     self.memory.hierarchy[related].add(theme)
     
     def print_semantic_summary(self):
         """Print summary of learned semantics"""
-        logger.info("\n" + "=" * 70)
-        logger.info("SEMANTIC MEMORY SUMMARY")
-        logger.info("=" * 70)
-        logger.info(f"Generation: {self.memory.generation}")
-        logger.info(f"Total themes: {len(self.memory.theme_counts)}")
-        logger.info(f"Total chunks processed: {self.memory.total_chunks_processed}")
-        logger.info(f"Concept clusters: {len(self.memory.clusters)}")
-        logger.info(f"Hierarchical relationships: {len(self.memory.hierarchy)}")
+        if self.mode == 'normal':
+            logger.info("\n📊 Theme Discovery (Normal Mode):")
+            for theme, count in self.discovered.most_common(15):
+                logger.info(f"  {theme}: {count}")
+            if len(self.discovered) > 15:
+                logger.info(f"  ... and {len(self.discovered) - 15} more themes")
+            return
         
-        logger.info("\n🔥 Top 20 Themes:")
+        # Adaptive mode summary
+        print("\n" + "=" * 70)
+        print("SEMANTIC MEMORY SUMMARY (Adaptive Mode)")
+        print("=" * 70)
+        print(f"Generation: {self.memory.generation}")
+        print(f"Total themes: {len(self.memory.theme_counts)}")
+        print(f"Total chunks processed: {self.memory.total_chunks_processed}")
+        print(f"Concept clusters: {len(self.memory.clusters)}")
+        print(f"Hierarchical relationships: {len(self.memory.hierarchy)}")
+        
+        print("\n🔥 Top 20 Themes:")
         for theme, count in self.memory.theme_counts.most_common(20):
             weight = self.memory.coherence_weights.get(theme, 1.0)
-            logger.info(f"  {theme:40s} | count: {count:4d} | weight: {weight:.2f}")
+            print(f"  {theme:40s} | count: {count:4d} | weight: {weight:.2f}")
         
-        logger.info("\n🔗 Top Concept Clusters:")
+        print("\n🔗 Top Concept Clusters:")
         for cluster_name, themes in list(self.memory.clusters.items())[:5]:
-            logger.info(f"  {cluster_name}: {', '.join(sorted(themes)[:6])}")
+            print(f"  {cluster_name}: {', '.join(sorted(themes)[:6])}")
         
-        logger.info("\n🌳 Hierarchical Relationships:")
+        print("\n🌳 Hierarchical Relationships:")
         for parent, children in list(self.memory.hierarchy.items())[:5]:
-            logger.info(f"  {parent} -> {', '.join(sorted(children)[:5])}")
+            print(f"  {parent} -> {', '.join(sorted(children)[:5])}")
         
-        logger.info("=" * 70)
+        print("=" * 70)
 
 # ============================================================================
 # QUALITY SCORER
 # ============================================================================
 
 class QualityScorer:
-    """Score text quality based on multiple heuristics"""
+    """Multi-dimensional quality scoring"""
     
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.weights = cfg.quality_weights
     
     def score(self, text: str) -> Dict[str, float]:
-        """Compute quality scores"""
-        scores = {}
-        
-        # Length quality: Gaussian around ideal length
-        ideal = self.cfg.chunk_size * 5  # approx chars, assuming avg word len ~5
-        length = len(text)
-        scores['length_quality'] = np.exp( -((length - ideal)**2) / (2 * (ideal/2)**2) )
-        
-        # Coherence: fraction of complete sentences
-        sentences = re.split(r'[.!?]+', text)
-        complete = sum(1 for s in sentences if s.strip() and s[0].isupper() and len(s.split()) > 3)
-        scores['coherence_quality'] = complete / len(sentences) if sentences else 0.5
-        
-        # Information density: unique words / total words
-        words = re.findall(r'\w+', text.lower())
-        unique = len(set(words))
-        scores['information_density'] = unique / len(words) if words else 0.5
-        
-        # Structural: presence of formatting elements
-        struct_points = 0
-        if '\n' in text: struct_points += 1
-        if re.search(r'^\s*[\-\*•]', text, re.M): struct_points += 1
-        if re.search(r'^\s*\d+\.', text, re.M): struct_points += 1
-        scores['structural_quality'] = min(struct_points / 3, 1.0)
-        
-        # Linguistic: average sentence length (ideal 15-25 words)
-        sent_lens = [len(re.findall(r'\w+', s)) for s in sentences if s.strip()]
-        avg_len = np.mean(sent_lens) if sent_lens else 0
-        ling_score = min(avg_len / 20, 1.0) if avg_len <= 20 else max(1 - (avg_len - 20)/20, 0.5)
-        scores['linguistic_quality'] = ling_score
-        
-        # Composite weighted score
-        composite = sum(scores.get(k, 0) * w for k, w in self.weights.items())
-        scores['composite_quality'] = composite
-        
-        return {k: float(round(v, 3)) for k, v in scores.items()}
+        """Calculate quality scores"""
+        scores = {
+            'length_quality': self._length(text),
+            'coherence_quality': self._coherence(text),
+            'information_density': self._info_density(text),
+            'structural_quality': self._structure(text),
+            'linguistic_quality': self._linguistics(text),
+        }
+        composite = sum(scores[k] * self.weights.get(k, 0.2) for k in scores)
+        scores['composite_quality'] = round(composite, 3)
+        return scores
+    
+    def _length(self, text):
+        L = len(text)
+        W = len(text.split())
+        if 100 <= L <= 2000 and 20 <= W <= 400:
+            return 1.0
+        if 50 <= L <= 3000 and 10 <= W <= 500:
+            return 0.7
+        if L >= 10 and W >= 3:
+            return 0.4
+        return 0.1
+    
+    def _coherence(self, text):
+        sents = re.split(r'[.!?]+', text)
+        complete = [s for s in sents if len(s.split()) >= 3]
+        score = 0.0
+        if sents:
+            score += 0.3 * (len(complete) / len(sents))
+        if re.search(r'[A-Z]', text):
+            score += 0.2
+        return min(score + 0.3, 1.0)
+    
+    def _info_density(self, text):
+        words = text.split()
+        if not words:
+            return 0.0
+        uniq = len(set(words)) / len(words)
+        score = 0.3 * uniq
+        if re.search(r'\d', text):
+            score += 0.2
+        return min(score + 0.3, 1.0)
+    
+    def _structure(self, text):
+        sents = [s for s in re.split(r'[.!?]+', text) if s.strip() and len(s.split()) >= 3]
+        score = 0.4 if len(sents) >= 2 else 0.0
+        if text.rstrip().endswith(('.', '!', '?')):
+            score += 0.3
+        return min(score + 0.3, 1.0)
+    
+    def _linguistics(self, text):
+        score = 0.0
+        if not re.search(r'\s{3,}', text):
+            score += 0.25
+        if not text.isupper() and not text.islower():
+            score += 0.25
+        if len(set(text.lower())) >= 20:
+            score += 0.25
+        return min(score + 0.25, 1.0)
 
 # ============================================================================
 # THREAD LINKER
 # ============================================================================
 
 class ThreadLinker:
-    """Link knowledge records into semantic threads based on similarity"""
+    """Create semantic threads"""
     
     def __init__(self, cfg: Config, embeddings: np.ndarray):
         self.cfg = cfg
-        self.embeddings = embeddings
+        self.emb = embeddings
     
-    def link(self, knowledge: List[Dict]) -> List[Dict]:
-        """Assign thread IDs to similar records"""
-        if len(knowledge) == 0 or len(self.embeddings) == 0:
-            return knowledge
+    def link(self, records: List[Dict]) -> List[Dict]:
+        """Link related chunks into threads"""
+        if not records:
+            return records
         
-        assigned = [-1] * len(knowledge)
-        thread_id = 0
+        logger.info("Creating semantic threads...")
+        threads = {}
+        mapping = {}
+        by_src = defaultdict(list)
         
-        for i in range(len(knowledge)):
-            if assigned[i] != -1:
+        for i, r in enumerate(records):
+            src = r.get('metadata', {}).get('filename', 'unknown')
+            by_src[src].append(i)
+        
+        tcount = 0
+        for src, idxs in by_src.items():
+            if len(idxs) <= 1:
                 continue
             
-            assigned[i] = thread_id
-            for j in range(i + 1, len(knowledge)):
-                if assigned[j] == -1:
-                    sim = cosine_similarity([self.embeddings[i]], [self.embeddings[j]])[0][0]
+            base = self.emb[idxs]
+            for i in range(len(idxs)):
+                gi = idxs[i]
+                if gi in mapping:
+                    continue
+                
+                tid = f"thread_{tcount:06d}"
+                threads[tid] = [gi]
+                mapping[gi] = tid
+                
+                for j in range(i + 1, min(i + 5, len(idxs))):
+                    gj = idxs[j]
+                    if gj in mapping:
+                        continue
+                    
+                    sim = cosine_similarity([base[i]], [base[j]])[0][0]
                     if sim >= self.cfg.thread_sim_threshold:
-                        assigned[j] = thread_id
-            
-            thread_id += 1
+                        threads[tid].append(gj)
+                        mapping[gj] = tid
+                
+                tcount += 1
         
-        # Add to metadata
-        for idx, rec in enumerate(knowledge):
-            rec['metadata']['thread_id'] = assigned[idx]
+        for i, r in enumerate(records):
+            if i in mapping:
+                tid = mapping[i]
+                r['thread_id'] = tid
+                r['metadata']['thread_size'] = len(threads[tid])
+                r['metadata']['thread_position'] = threads[tid].index(i) + 1
+            else:
+                r['thread_id'] = f"single_{uuid.uuid4().hex[:12]}"
+                r['metadata']['thread_size'] = 1
+                r['metadata']['thread_position'] = 1
         
-        logger.info(f"✓ Linked {len(knowledge)} records into {thread_id} threads")
-        return knowledge
+        logger.info(f"✓ Created {len(threads)} threads")
+        return records
 
 # ============================================================================
 # KNOWLEDGE BUILDER
 # ============================================================================
 
 class KnowledgeBuilder:
-    """Build knowledge records with dedup, grouping, and semantic threads"""
+    """Build knowledge records with quality scoring"""
     
     def __init__(self, cfg: Config, embedder: EmbeddingStore):
         self.cfg = cfg
         self.embedder = embedder
         self.qual = QualityScorer(cfg)
-        if cfg.enable_semantic_labeling:
-            if cfg.semantic_labeler_type == 'adaptive':
-                self.labeler = AdaptiveSemanticLabeler(cfg, embedder.model)
-                if os.path.exists('semantic_memory.pkl'):
-                    self.labeler.load_semantic_state('semantic_memory.pkl')
-            elif cfg.semantic_labeler_type == 'original':
-                self.labeler = SemanticLabeler(cfg)
-            else:
-                raise ValueError(f"Unknown semantic labeler type: {cfg.semantic_labeler_type}")
-        else:
-            self.labeler = None
+        self.labeler = SemanticLabeler(cfg, embedder.model) if cfg.enable_semantic_labeling else None
     
     def dedup(self, chunks: List[Dict]) -> List[Dict]:
-        """Deduplicate chunks with hashing"""
+        """Remove duplicates"""
         seen = set()
-        unique = []
-        
-        for ch in chunks:
-            h = hashlib.md5(ch['text'].encode()).hexdigest()
+        out = []
+        for c in chunks:
+            h = hashlib.sha256(c['text'].encode()).hexdigest()
             if h not in seen:
                 seen.add(h)
-                unique.append(ch)
-        
-        if len(chunks) != len(unique):
-            logger.info(f"Deduplicated: {len(chunks)} → {len(unique)}")
-        
-        return unique
+                out.append(c)
+        logger.info(f"Deduplicated: {len(chunks)} → {len(out)}")
+        return out
     
     def group_consecutive(self, chunks: List[Dict], embeddings: np.ndarray) -> Tuple[List[Dict], np.ndarray]:
-        """Group similar consecutive chunks by source"""
-        if len(chunks) == 0:
+        """Group similar consecutive chunks"""
+        if not chunks:
             return [], np.array([])
         
         logger.info("Grouping similar chunks...")
@@ -1533,7 +1402,6 @@ class QABuilder:
                     normalize_embeddings=True
                 )
                 
-                # Diversity check
                 if existing_ans_embeds:
                     sims = [cosine_similarity([ans_emb], [e])[0][0] for e in existing_ans_embeds]
                     if any(s > self.cfg.qa_diversity_sim_threshold for s in sims):
@@ -1595,14 +1463,11 @@ def stratified_splits(items: List[Dict], split_ratio: Tuple[float, float, float]
     if not items:
         return {'train': [], 'validation': [], 'test': []}
     
-    # Determine which key to use
     key = 'quality_scores' if 'quality_scores' in items[0] else 'quality_metrics'
     metric_key = 'composite_quality' if key == 'quality_scores' else 'quality_score'
     
-    # Sort by quality
     items = sorted(items, key=lambda x: x[key][metric_key], reverse=True)
     
-    # Shuffle within quartiles for diversity
     total = len(items)
     q = 4
     for i in range(q):
@@ -1612,7 +1477,6 @@ def stratified_splits(items: List[Dict], split_ratio: Tuple[float, float, float]
         random.shuffle(block)
         items[s:e] = block
     
-    # Split
     tr_end = int(total * split_ratio[0])
     va_end = tr_end + int(total * split_ratio[1])
     
@@ -1638,7 +1502,7 @@ def run(cfg: Config):
     logger.info(f"Workers: {cfg.max_workers}")
     logger.info(f"OCR: {cfg.enable_ocr and OCR_AVAILABLE}")
     logger.info(f"Sections: {cfg.extract_sections}")
-    logger.info(f"Semantic labeling: {cfg.enable_semantic_labeling} ({cfg.semantic_labeler_type})")
+    logger.info(f"Semantic labeling: {cfg.enable_semantic_labeling} (mode: {cfg.semantic_mode})")
     logger.info(f"Q&A Generation: {cfg.generate_qa}")
     logger.info("=" * 70)
     
@@ -1666,11 +1530,11 @@ def run(cfg: Config):
     logger.info(f"\n[Stage 4/7] Building knowledge records...")
     kb = KnowledgeBuilder(cfg, store)
     knowledge, k_emb = kb.build(chunks)
-
-    if cfg.enable_semantic_labeling and kb.labeler and cfg.semantic_labeler_type == 'adaptive':
+    
+    # Stage 3.5: Adaptive learning (if enabled)
+    if cfg.enable_semantic_labeling and kb.labeler and cfg.semantic_mode == 'adaptive':
         kb.labeler.learn_from_run()
-        kb.labeler.save_semantic_state('semantic_memory.pkl')
-        kb.labeler.print_semantic_summary()
+        kb.labeler.save_memory()
     
     # Stage 4: Thread linking
     logger.info(f"\n[Stage 5/7] Linking semantic threads...")
@@ -1696,7 +1560,6 @@ def run(cfg: Config):
         qa_builder = QABuilder(cfg, store)
         qa_pairs = qa_builder.build(knowledge)
         
-        # Split and save Q&A
         qa_splits = stratified_splits(qa_pairs, cfg.split_ratio)
         
         for name, data in qa_splits.items():
@@ -1706,7 +1569,6 @@ def run(cfg: Config):
         logger.info("\nSkipping Q&A generation as per --no-qa flag.")
         qa_pairs = []
         qa_splits = {'train': [], 'validation': [], 'test': []}
-
     
     # Final statistics
     elapsed = time.time() - start_time
@@ -1730,22 +1592,12 @@ def run(cfg: Config):
         logger.info(f"  - Test: {len(qa_splits['test'])}")
     logger.info(f"\nProcessing time: {elapsed / 60:.2f} minutes")
     if pdfp.stats['successful'] > 0:
-      logger.info(f"Average: {elapsed / pdfp.stats['successful']:.1f}s per PDF")
+        logger.info(f"Average: {elapsed / pdfp.stats['successful']:.1f}s per PDF")
     logger.info("=" * 70)
     
     # Semantic labeling stats
     if cfg.enable_semantic_labeling and kb.labeler:
-        logger.info("\n📊 Theme Discovery:")
-        if cfg.semantic_labeler_type == 'adaptive':
-            top = kb.labeler.memory.theme_counts.most_common(15)
-            total = len(kb.labeler.memory.theme_counts)
-        else:
-            top = kb.labeler.discovered.most_common(15)
-            total = len(kb.labeler.discovered)
-        for theme, count in top:
-            logger.info(f"  {theme}: {count}")
-        if total > 15:
-            logger.info(f"  ... and {total - 15} more themes")
+        kb.labeler.print_semantic_summary()
 
 # ============================================================================
 # DIAGNOSTIC UTILITIES
@@ -1820,7 +1672,6 @@ def test_single_pdf(pdf_path: str):
     logger.info(f"Method 2 (page-by-page):    {len(text2)} chars")
     logger.info(f"Method 3 (PyPDF2):          {len(text3)} chars")
     
-    # Show which method extracted the most
     best = max([(len(text1), "extract_text", text1),
                 (len(text2), "page-by-page", text2),
                 (len(text3), "PyPDF2", text3)],
@@ -1828,7 +1679,6 @@ def test_single_pdf(pdf_path: str):
     
     logger.info(f"\n✓ Best method: {best[1]} with {best[0]} characters")
     
-    # Save sample output
     sample_file = "extraction_sample.txt"
     with open(sample_file, 'w', encoding='utf-8') as f:
         f.write(f"=== EXTRACTION TEST: {pdf_path} ===\n\n")
@@ -1841,7 +1691,6 @@ def test_single_pdf(pdf_path: str):
     logger.info(f"\n✓ Full extraction saved to: {sample_file}")
     logger.info("=" * 70)
 
-
 # ============================================================================
 # CLI
 # ============================================================================
@@ -1849,12 +1698,18 @@ def test_single_pdf(pdf_path: str):
 def cli():
     """Command-line interface"""
     p = argparse.ArgumentParser(
-        description='Production PDF → Memory → Q&A Pipeline',
+        description='Production PDF → Memory → Q&A Pipeline with Adaptive Semantics',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Basic usage with parallel processing
   python adaptive_semantic.py --pdf-dir ./PDFs --workers 16
+  
+  # Normal semantic mode (stateless heuristics)
+  python adaptive_semantic.py --pdf-dir ./PDFs --enable-semantic-labeling
+  
+  # Adaptive semantic mode (learns from previous runs)
+  python adaptive_semantic.py --pdf-dir ./PDFs --enable-semantic-labeling --semantic-mode adaptive
   
   # Run on CPU even if GPU is available
   python adaptive_semantic.py --pdf-dir ./PDFs --force-cpu
@@ -1862,9 +1717,9 @@ Examples:
   # Disable Q&A generation for a faster memory-only run
   python adaptive_semantic.py --pdf-dir ./PDFs --no-qa
 
-  # Full features: OCR + semantic labeling
+  # Full features: OCR + adaptive semantic labeling
   python adaptive_semantic.py --pdf-dir ./PDFs --workers 16 \\
-    --enable-ocr --enable-semantic-labeling
+    --enable-ocr --enable-semantic-labeling --semantic-mode adaptive
   
   # Fast mode: no sections, no semantic labeling
   python adaptive_semantic.py --pdf-dir ./PDFs --workers 32 \\
@@ -1872,14 +1727,22 @@ Examples:
   
   # Maximum quality
   python adaptive_semantic.py --pdf-dir ./PDFs --workers 16 \\
-    --enable-ocr --enable-semantic-labeling \\
+    --enable-ocr --enable-semantic-labeling --semantic-mode adaptive \\
     --chunk-size 400 --qa-max-pairs-per-source 10000
+
+Semantic Modes:
+  - normal: Fast heuristic-based labeling (stateless)
+  - adaptive: Self-bootstrapping semantic learning (learns from previous runs)
+    * Generation 0: Uses heuristics
+    * Generation 1+: Applies learned co-occurrence patterns and coherence weights
+    * Generation 3+: Stable concept hierarchies and centroid matching
 
 Performance tips:
   - Use --workers matching your CPU core count
   - The script will auto-detect and use a GPU unless --force-cpu is specified
   - Disable --no-sections if not needed (faster)
   - OCR is slow; only enable if you have scanned PDFs
+  - Adaptive mode builds a semantic memory file that improves over multiple runs
         """
     )
     
@@ -1916,14 +1779,17 @@ Performance tips:
     # Semantic labeling
     p.add_argument('--enable-semantic-labeling', action='store_true',
                    help='Enable semantic theme labeling')
-    p.add_argument('--semantic-labeler-type', choices=['original', 'adaptive'], default='adaptive',
-                   help='Type of semantic labeler to use')
+    p.add_argument('--semantic-mode', choices=['normal', 'adaptive'],
+                   default='normal',
+                   help='Semantic labeling mode: normal (stateless) or adaptive (self-learning)')
+    p.add_argument('--semantic-memory-path', default='semantic_memory.pkl',
+                   help='Path to semantic memory file (adaptive mode only)')
     p.add_argument('--semantic-method', choices=['llm', 'tfidf', 'hybrid'],
                    default='tfidf',
-                   help='Semantic labeling method')
+                   help='Semantic labeling method (legacy, unused)')
     p.add_argument('--semantic-model', 
                    default='deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B',
-                   help='LLM model for semantic labeling')
+                   help='LLM model for semantic labeling (legacy, unused)')
     
     # Thresholds
     p.add_argument('--sim-threshold', type=float, default=0.7,
@@ -1982,7 +1848,8 @@ Performance tips:
         embedding_model=args.embedding_model,
         force_cpu=args.force_cpu,
         enable_semantic_labeling=args.enable_semantic_labeling,
-        semantic_labeler_type=args.semantic_labeler_type,
+        semantic_mode=args.semantic_mode,
+        semantic_memory_path=args.semantic_memory_path,
         semantic_method=args.semantic_method,
         semantic_model=args.semantic_model,
         sim_threshold=args.sim_threshold,
