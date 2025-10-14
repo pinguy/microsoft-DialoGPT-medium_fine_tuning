@@ -571,6 +571,7 @@ class SemanticLabeler:
     """
     
     STOPWORDS = {
+        # Common words
         'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
         'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'be',
         'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
@@ -580,6 +581,17 @@ class SemanticLabeler:
         'however', 'therefore', 'thus', 'hence', 'moreover', 'furthermore',
         'said', 'say', 'get', 'make', 'go', 'take', 'see', 'come', 'think',
         'know', 'want', 'give', 'use', 'find', 'tell', 'ask', 'work', 'call',
+        # Pronouns
+        'i', 'you', 'he', 'she', 'it', 'we', 'they', 'them', 'their', 'this',
+        'that', 'these', 'those', 'my', 'your', 'his', 'her', 'its', 'our',
+        # Transition words
+        'however', 'therefore', 'thus', 'hence', 'moreover', 'furthermore',
+        'nevertheless', 'nonetheless', 'meanwhile', 'otherwise', 'besides',
+        'also', 'too', 'either', 'neither', 'both', 'all', 'any', 'some',
+        'each', 'every', 'many', 'much', 'more', 'most', 'other', 'another',
+        'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than',
+        'too', 'very', 'just', 'now', 'then', 'there', 'here', 'where',
+        'when', 'what', 'which', 'who', 'whom', 'whose', 'why', 'how',
     }
     
     def __init__(self, cfg: Config, embedding_model=None):
