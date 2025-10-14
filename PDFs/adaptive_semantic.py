@@ -1005,30 +1005,30 @@ class SemanticLabeler:
                 logger.info(f"  ... and {len(self.discovered) - 15} more themes")
             return
         
-        # Adaptive mode summary
-        print("\n" + "=" * 70)
-        print("SEMANTIC MEMORY SUMMARY (Adaptive Mode)")
-        print("=" * 70)
-        print(f"Generation: {self.memory.generation}")
-        print(f"Total themes: {len(self.memory.theme_counts)}")
-        print(f"Total chunks processed: {self.memory.total_chunks_processed}")
-        print(f"Concept clusters: {len(self.memory.clusters)}")
-        print(f"Hierarchical relationships: {len(self.memory.hierarchy)}")
+        # Adaptive mode summary - use logger for consistency
+        logger.info("\n" + "=" * 70)
+        logger.info("SEMANTIC MEMORY SUMMARY (Adaptive Mode)")
+        logger.info("=" * 70)
+        logger.info(f"Generation: {self.memory.generation}")
+        logger.info(f"Total themes: {len(self.memory.theme_counts)}")
+        logger.info(f"Total chunks processed: {self.memory.total_chunks_processed}")
+        logger.info(f"Concept clusters: {len(self.memory.clusters)}")
+        logger.info(f"Hierarchical relationships: {len(self.memory.hierarchy)}")
         
-        print("\n🔥 Top 20 Themes:")
+        logger.info("\n🔥 Top 20 Themes:")
         for theme, count in self.memory.theme_counts.most_common(20):
             weight = self.memory.coherence_weights.get(theme, 1.0)
-            print(f"  {theme:40s} | count: {count:4d} | weight: {weight:.2f}")
+            logger.info(f"  {theme:40s} | count: {count:4d} | weight: {weight:.2f}")
         
-        print("\n🔗 Top Concept Clusters:")
+        logger.info("\n🔗 Top Concept Clusters:")
         for cluster_name, themes in list(self.memory.clusters.items())[:5]:
-            print(f"  {cluster_name}: {', '.join(sorted(themes)[:6])}")
+            logger.info(f"  {cluster_name}: {', '.join(sorted(themes)[:6])}")
         
-        print("\n🌳 Hierarchical Relationships:")
+        logger.info("\n🌳 Hierarchical Relationships:")
         for parent, children in list(self.memory.hierarchy.items())[:5]:
-            print(f"  {parent} -> {', '.join(sorted(children)[:5])}")
+            logger.info(f"  {parent} -> {', '.join(sorted(children)[:5])}")
         
-        print("=" * 70)
+        logger.info("=" * 70)
 
 # ============================================================================
 # QUALITY SCORER
