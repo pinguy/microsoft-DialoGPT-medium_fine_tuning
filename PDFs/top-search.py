@@ -4,7 +4,7 @@ import re
 import collections
 
 # Step 1: Recreate embedded_theme_top25 by scanning for semantic themes
-path = "/mnt/data/dataset_qa_train.jsonl.gz
+path = "/mnt/data/dataset_qa_train.jsonl.gz"
 theme_counter = collections.Counter()
 
 with gzip.open(path, "rt", encoding="utf-8") as f:
