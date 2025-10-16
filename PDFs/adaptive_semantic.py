@@ -163,55 +163,56 @@ class Config:
 # ============================================================================
 
 def clean_text(text: str) -> str:
+    # --- Normalize encoding issues ---
     text = ftfy.fix_encoding(text)
     text = ftfy.fix_text(text)
-    # Normalize stray whitespace
-    text = re.sub(r'[ \t]+', ' ', text)
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    # Strip zero-width and invisible characters
+
+    # --- Whitespace normalization ---
+    text = re.sub(r'[ \t]+', ' ', text)         # collapse tabs/spaces
+    text = re.sub(r'\n{3,}', '\n\n', text)      # reduce multi-blank lines
+
+    # --- Strip zero-width and invisible characters ---
     text = re.sub(r'[\u200B-\u200D\uFEFF]', '', text)
-    # Fix line-break hyphens safely
+
+    # --- Fix line-break hyphens (e.g., "exam-\nple" → "example") ---
     text = re.sub(r'(\w)-\s+(\w)', r'\1\2', text)
-    # Collapse all newlines into single spaces
+
+    # --- Collapse newlines into spaces (paragraph flattening) ---
     text = re.sub(r'\s*\n\s*', ' ', text)
-    # REMOVE UNWANTED QUOTES AROUND SINGLE WORDS OR PHRASES
-    # This targets the specific pattern of quotes around single words like "trapped"
-    # or phrases like "Certificate of Premedical College Work,"
-   
-    # Remove quotes around single words (handles the "trapped" case)
-    text = re.sub(r'\b"(\w+)"\b', r'\1', text)
-   
-    # Remove quotes around phrases that end with punctuation (handles the certificate cases)
-    text = re.sub(r'"([^"]+[.,!?])"', r'\1', text)
-   
-    # Remove quotes around phrases without ending punctuation
-    text = re.sub(r'"([A-Z][^"]*?)"(?=\s|$)', r'\1', text)
-   
-    # Clean up any remaining escaped quotes from JSON artifacts
+
+    # --- Remove extraneous quotation marks from isolated words/phrases ---
+    text = re.sub(r'\b"(\w+)"\b', r'\1', text)                     # "trapped" → trapped
+    text = re.sub(r'"([^"]+[.,!?])"', r'\1', text)                 # "phrase," → phrase,
+    text = re.sub(r'"([A-Z][^"]*?)"(?=\s|$)', r'\1', text)         # "Certificate ..." → Certificate ...
+
+    # --- Clean escaped quotes from JSON artifacts ---
     text = re.sub(r'\\(["\'])', r'\1', text)
-   
-    # Handle any remaining double-escaped quotes
-    while '\\\"' in text or '\\\'' in text:
-        text = text.replace('\\\"', '"')
-        text = text.replace('\\\'', "'")
-   
-    # Fix markdown + quote mismatches: *", "* etc.
-    text = re.sub(r'\*+"', '"', text) # remove redundant *"
-    text = re.sub(r'"\*+', '"', text) # remove redundant "*
+    while '\\\"' in text or "\\\'" in text:
+        text = text.replace('\\\"', '"').replace("\\\'", "'")
+
+    # --- Fix markdown/quote mismatches ---
+    text = re.sub(r'\*+"', '"', text)
+    text = re.sub(r'"\*+', '"', text)
     text = re.sub(r'\*\s*"', ' *"', text)
     text = re.sub(r'"\s*\*', '"* ', text)
-    # Replace 9 with ' in contraction positions (e.g., I9ve -> I've, it9s -> it's)
-    text = re.sub(r"(?<=[a-zA-Z])9(?=[vtsnremld])", "'", text)
-    # Collapse accidental punctuation before or after quotes
-    text = re.sub(r'([!?.,]){2,}["\']', r'\1"', text)
-    # Normalize multi-spaces
-    text = re.sub(r' {2,}', ' ', text)
-    # FINAL CLEANUP: Remove any stray quote marks that don't serve a purpose
-    # This is more aggressive - only use if you want to remove most quotes
-    # text = re.sub(r'(?<!\w)"(?!\w)|(?<!\w)"(?=\w)|(?<=\w)"(?!\w)', '', text)
-   
-    return text.strip()
 
+    # --- OCR corrections: apostrophes and "g" substitutions ---
+    # 1. Fix contractions (don9t → don't, it9s → it's, they9re → they're)
+    text = re.sub(r"(?i)\b([a-z]+)9(?=(?:t|s|m|re|ve|ll|d)\b)", r"\1'", text)
+
+    # 2. Fix gerunds (drivin9 → driving)
+    text = re.sub(r"(?i)(?<=in)9(?=\b|[^a-z])", "g", text)
+
+    # 3. Fix possessives (John9s → John's)
+    text = re.sub(r"(?i)\b([a-z]{2,})9(?=s\b)", r"\1'", text)
+
+    # --- Clean double punctuation before quotes ---
+    text = re.sub(r'([!?.,]){2,}["\']', r'\1"', text)
+
+    # --- Normalize multiple spaces ---
+    text = re.sub(r' {2,}', ' ', text)
+
+    return text.strip()
 
 def validate_text(text: str, cfg: Config) -> bool:
     """Validate text quality"""
