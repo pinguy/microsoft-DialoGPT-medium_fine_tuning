@@ -212,6 +212,13 @@ def clean_text(text: str) -> str:
     # --- Normalize multiple spaces ---
     text = re.sub(r' {2,}', ' ', text)
 
+    # Fix rare OCR remnants like "9em"
+    text = re.sub(r'\b9em\b', 'em', text)
+
+    # Remove stray standalone 9s that aren't part of a number
+    text = re.sub(r'(?<!\d)9(?!\d)', '', text)
+
+
     return text.strip()
 
 def validate_text(text: str, cfg: Config) -> bool:
