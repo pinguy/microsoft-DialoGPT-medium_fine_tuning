@@ -1,16 +1,3 @@
-#!/usr/bin/env python3
-"""
-Enhanced Dataset Quality Analyzer
-==================================
-Analyzes Q&A datasets with semantic themes and quality metrics.
-
-Shows:
-- Top themes by frequency
-- Quality distribution
-- Semantic diversity
-- Sample high-quality entries
-"""
-
 import gzip
 import json
 import re
@@ -178,22 +165,9 @@ def compare_splits(prefix="dataset"):
             print(f"  Unique themes: {len(themes):,}")
             print(f"  Avg quality: {avg_q:.3f}")
 
-if __name__ == "__main__":
-    import sys
-    
-    # Default path
-    path = ""/mnt/data/Hofstadter.jsonl.gz""
-    
-    # Allow override from command line
-    if len(sys.argv) > 1:
-        path = sys.argv[1]
-    
-    # Main analysis
-    results = analyze_dataset(path)
-    
-    # Compare splits if available
-    compare_splits()
-    
-    print("\n" + "=" * 70)
-    print("✓ Analysis complete!")
-    print("=" * 70)
+# Execute analysis
+results = analyze_dataset("/mnt/data/Hofstadter.jsonl.gz")
+compare_splits()
+print("\n" + "=" * 70)
+print("✓ Analysis complete!")
+print("=" * 70)
