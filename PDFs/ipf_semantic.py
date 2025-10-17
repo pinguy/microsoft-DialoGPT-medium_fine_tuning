@@ -19,7 +19,7 @@ Key improvements:
 # Required for IPF functionality
 pip install ipfn
 
-# Other requirements (already in your script)
+# Other requirements
 pip install sentence-transformers sklearn ftfy pdfminer.six numpy tqdm torch
 
 Usage:
