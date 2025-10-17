@@ -26,7 +26,7 @@ Usage:
   # Normal mode with TF-IDF (default, stateless heuristics)
   python ipf_semantic.py --pdf-dir ./PDFs --enable-semantic-labeling
 
-  python3 ipf_semantic.py --pdf-dir ./PDFs --force-cpu --enable-semantic-labeling --semantic-mode normal --semantic-method hybrid --no-save-intermediates
+  python3 ipf_semantic.py --pdf-dir ./PDFs --force-cpu --enable-semantic-labeling --semantic-mode adaptive --semantic-method hybrid
   
   # Adaptive mode with IPF enhancement (learns from previous runs)
   python ipf_semantic.py --pdf-dir ./PDFs --enable-semantic-labeling --semantic-mode adaptive --semantic-method ipf
@@ -80,10 +80,10 @@ except:
     FAISS_AVAILABLE = False
 
 try:
-    from pyipf import IPF
-    IPFN_AVAILABLE = True
+    import pyipf
+    PYIPF_AVAILABLE = True
 except:
-    IPFN_AVAILABLE = False
+    PYIPF_AVAILABLE = False
 
 # Logging
 logging.basicConfig(
@@ -628,7 +628,7 @@ class SemanticMemory:
     clusters: Dict[str, Set[str]] = field(default_factory=dict)
     centroids: Dict[str, np.ndarray] = field(default_factory=dict)
     coherence_weights: Dict[str, float] = field(default_factory=dict)
-    hierarchy: Dict[str, Dict[str, float]] = field(default_factory=lambda: defaultdict(dict))  # Changed from Set to Dict[str, float]
+    hierarchy: Dict[str, Set[str]] = field(default_factory=lambda: defaultdict(set))
     high_mi_pairs: Dict[Tuple[str, str], float] = field(default_factory=dict)
     generation: int = 0
     ipf_generation: int = 0
@@ -648,8 +648,8 @@ class IPFSemanticEnhancer:
     def __init__(self, memory: SemanticMemory, cfg: Config):
         self.memory = memory
         self.cfg = cfg
-        if not IPFN_AVAILABLE:
-            logger.warning("⚠️  ipfn not installed. Install with: pip install ipfn")
+        if not PYIPF_AVAILABLE:
+            logger.warning("⚠️  pyipf not installed. Install with: pip install pyipf")
     
     def calibrate_cooccurrence(self, 
                                expected_marginals: dict = None):
@@ -660,8 +660,8 @@ class IPFSemanticEnhancer:
         Args:
             expected_marginals: Dict of theme -> expected frequency
         """
-        if not IPFN_AVAILABLE:
-            logger.warning("IPF calibration skipped (ipfn not installed)")
+        if not PYIPF_AVAILABLE:
+            logger.warning("IPF calibration skipped (pyipf not installed)")
             return
         
         if not self.cfg.ipf_calibrate_cooccurrence:
@@ -703,14 +703,9 @@ class IPFSemanticEnhancer:
         
         # Apply IPF
         try:
-            aggregates = [row_marginals, col_marginals]
-            dimensions = [[0], [1]]
-            
-            IPF = ipfn.ipfn(co_matrix, aggregates, dimensions, 
-                           convergence_rate=self.cfg.ipf_convergence_rate,
-                           max_iteration=self.cfg.ipf_max_iterations)
-            
-            calibrated_matrix = IPF.iteration()
+            calibrated_matrix = pyipf.ipf(co_matrix, row_marginals, col_marginals, 
+                                          tol=self.cfg.ipf_convergence_rate, 
+                                          maxiter=self.cfg.ipf_max_iterations)
             
             # Update co-occurrence with calibrated values
             for i, theme_a in enumerate(themes):
@@ -730,7 +725,7 @@ class IPFSemanticEnhancer:
         Use IPF to enforce hierarchical constraints:
         Parent theme frequency = sum of child frequencies
         """
-        if not IPFN_AVAILABLE or not self.memory.hierarchy:
+        if not PYIPF_AVAILABLE or not self.memory.hierarchy:
             return
         
         if not self.cfg.ipf_balance_hierarchy:
@@ -770,13 +765,9 @@ class IPFSemanticEnhancer:
         col_totals = [self.memory.theme_counts[c] for c in children_list]
         
         try:
-            aggregates = [row_totals, col_totals]
-            dimensions = [[0], [1]]
-            
-            IPF = ipfn.ipfn(table + 0.1, aggregates, dimensions,
-                           convergence_rate=self.cfg.ipf_convergence_rate,
-                           max_iteration=self.cfg.ipf_max_iterations)
-            balanced_table = IPF.iteration()
+            balanced_table = pyipf.ipf(table + 0.1, row_totals, col_totals, 
+                                       tol=self.cfg.ipf_convergence_rate, 
+                                       maxiter=self.cfg.ipf_max_iterations)
             
             # Update hierarchy weights
             for i, parent in enumerate(parent_themes):
@@ -799,7 +790,7 @@ class IPFSemanticEnhancer:
         Args:
             target_distribution: Dict of theme -> target probability
         """
-        if not IPFN_AVAILABLE:
+        if not PYIPF_AVAILABLE:
             return
         
         if not self.cfg.ipf_smooth_distributions:
@@ -843,13 +834,9 @@ class IPFSemanticEnhancer:
         row_totals = doc_theme_matrix.sum(axis=1).tolist()
         
         try:
-            aggregates = [row_totals, col_totals]
-            dimensions = [[0], [1]]
-            
-            IPF = ipfn.ipfn(doc_theme_matrix, aggregates, dimensions,
-                           convergence_rate=self.cfg.ipf_convergence_rate,
-                           max_iteration=self.cfg.ipf_max_iterations)
-            smoothed_matrix = IPF.iteration()
+            smoothed_matrix = pyipf.ipf(doc_theme_matrix, row_totals, col_totals, 
+                                        tol=self.cfg.ipf_convergence_rate, 
+                                        maxiter=self.cfg.ipf_max_iterations)
             
             # Update theme counts with smoothed values
             for j, theme in enumerate(themes):
@@ -1173,7 +1160,7 @@ class SemanticLabeler:
         """Extract domain-specific keyword patterns"""
         patterns = [
             r'\b(\w+\s+(?:algorithm|method|approach|technique|model|system))\b',
-            r'\b(\w+\s+(?:theory|theorem|principle|law|concept))\b',
+            r'\b(\w+\s+(?: theory|theorem|principle|law|concept))\b',
             r'\b(\w+\s+(?:analysis|study|research))\b',
             r'\b(\w+\s+(?:process|procedure|mechanism))\b',
         ]
@@ -1347,7 +1334,7 @@ class SemanticLabeler:
         self._build_hierarchy()
         
         # Phase 7: IPF Enhancement (if method is ipf or hybrid)
-        if self.method in ['ipf', 'hybrid'] and IPFN_AVAILABLE:
+        if self.method in ['ipf', 'hybrid'] and PYIPF_AVAILABLE:
             logger.info("  Applying IPF enhancement...")
             enhancer = IPFSemanticEnhancer(self.memory, self.cfg)
             
@@ -1365,8 +1352,8 @@ class SemanticLabeler:
             
             self.memory.ipf_generation += 1
             logger.info(f"✓ IPF enhancement complete (IPF Gen {self.memory.ipf_generation})")
-        elif self.method in ['ipf', 'hybrid'] and not IPFN_AVAILABLE:
-            logger.warning(f"⚠️  IPF method selected but ipfn not available. Install with: pip install ipfn")
+        elif self.method in ['ipf', 'hybrid'] and not PYIPF_AVAILABLE:
+            logger.warning(f"⚠️  IPF method selected but pyipf not available. Install with: pip install pyipf")
         
         # Update statistics
         self.memory.total_chunks_processed += len(self._current_run_records)
@@ -1464,15 +1451,7 @@ class SemanticLabeler:
                 related_count = self.memory.theme_counts[related]
                 
                 if co_count / theme_count > 0.7 and related_count > theme_count * 2:
-                    # Initialize as dict if needed
-                    if related not in self.memory.hierarchy:
-                        self.memory.hierarchy[related] = {}
-                    elif isinstance(self.memory.hierarchy[related], set):
-                        # Convert old set format to dict
-                        old_set = self.memory.hierarchy[related]
-                        self.memory.hierarchy[related] = {c: 1.0 for c in old_set}
-                    
-                    self.memory.hierarchy[related][theme] = 1.0
+                    self.memory.hierarchy[related].add(theme)
     
     def print_semantic_summary(self):
         """Print summary of learned semantics"""
@@ -2014,7 +1993,7 @@ def run(cfg: Config):
         logger.info(f"  - Mode: {cfg.semantic_mode}")
         logger.info(f"  - Method: {cfg.semantic_method}")
         if cfg.semantic_method in ['ipf', 'hybrid']:
-            logger.info(f"  - IPF available: {IPFN_AVAILABLE}")
+            logger.info(f"  - IPF available: {PYIPF_AVAILABLE}")
     logger.info(f"Q&A Generation: {cfg.generate_qa}")
     logger.info("=" * 70)
     
@@ -2250,7 +2229,7 @@ Examples:
 
 Semantic Methods:
   - tfidf: Fast TF-IDF based theme extraction (default)
-  - ipf: IPF-enhanced adaptive learning (requires: pip install ipfn)
+  - ipf: IPF-enhanced adaptive learning (requires: pip install pyipf)
   - hybrid: Combines TF-IDF + IPF for best results
   - llm: LLM-based labeling (placeholder, not implemented)
 
@@ -2273,7 +2252,7 @@ Performance tips:
   - Disable --no-sections if not needed (faster)
   - OCR is slow; only enable if you have scanned PDFs
   - Adaptive mode builds a semantic memory file that improves over multiple runs
-  - IPF requires 'ipfn' package: pip install ipfn
+  - IPF requires 'pyipf' package: pip install pyipf
         """
     )
     
@@ -2315,7 +2294,7 @@ Performance tips:
                    help='Semantic labeling mode: normal (stateless) or adaptive (self-learning)')
     p.add_argument('--semantic-method', choices=['tfidf', 'ipf', 'hybrid', 'llm'],
                    default='tfidf',
-                   help='Semantic labeling method: tfidf (default), ipf (requires ipfn), hybrid (tfidf+ipf), llm (not implemented)')
+                   help='Semantic labeling method: tfidf (default), ipf (requires pyipf), hybrid (tfidf+ipf), llm (not implemented)')
     p.add_argument('--semantic-memory-path', default='semantic_memory.pkl',
                    help='Path to semantic memory file (adaptive mode only)')
     p.add_argument('--semantic-model', 
@@ -2380,10 +2359,10 @@ Performance tips:
         return
     
     # Warn about IPF requirements
-    if args.semantic_method in ['ipf', 'hybrid'] and not IPFN_AVAILABLE:
+    if args.semantic_method in ['ipf', 'hybrid'] and not PYIPF_AVAILABLE:
         logger.warning("=" * 70)
-        logger.warning("⚠️  WARNING: IPF method selected but 'ipfn' is not installed!")
-        logger.warning("Install with: pip install ipfn")
+        logger.warning("⚠️  WARNING: IPF method selected but 'pyipf' is not installed!")
+        logger.warning("Install with: pip install pyipf")
         logger.warning("Continuing with degraded functionality...")
         logger.warning("=" * 70)
     
