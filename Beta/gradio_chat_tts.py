@@ -14,19 +14,15 @@ import time
 import webbrowser
 import uuid
 import gc
-import asyncio
 import concurrent.futures
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from sentence_transformers import SentenceTransformer
 import logging
 import multiprocessing
-from functools import lru_cache
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict, Any
 from contextlib import contextmanager
 import psutil
 from pathlib import Path
-import random # Added for optional dialogical self simulation
 
 # Try to import optional dependencies
 try:
@@ -52,16 +48,17 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 # Configuration
 @dataclass
 class Config:
-    base_dir: str = "./dialogpt-finetuned/"
-    coherence_threshold: float = 0.4 # Lowered slightly for more flexibility, but still effective
-    use_coherence: bool = True
+    base_dir: str = "./dialogpt-finetuned/"  # Path to the parent directory of your checkpoints
     vosk_model_path: str = "vosk-model-en-us-0.42-gigaspeech"
     server_port: int = 7860
     auto_open_browser: bool = True
     max_cache_size: int = 100
-    max_response_length: int = 150
-    tts_max_length: int = 200
-    memory_cleanup_threshold: float = 0.8  # Clean memory when usage exceeds 80%
+    max_response_length: int = 512
+    tts_max_length: int = 500
+    memory_cleanup_threshold: float = 0.8
+    # DeepSeek-R1 specific settings
+    show_reasoning: bool = False  # Whether to show <think> blocks
+    use_system_prompt: bool = True
 
 config = Config()
 
@@ -70,37 +67,19 @@ DEVICE = torch.device("cpu")
 DEVICE_INFO = "CPU (default)"
 DEVICE_DETAILS = {}
 
-# Patch: Add unit consistency checker function
-def unit_consistency_check(prompt, response):
-    """
-    Checks for mismatched units between prompt and response.
-    Specifically looks for cases like 'meter per hour' in prompt
-    and 'meter per second' or 'm/s' in response.
-    """
-    if re.search(r"\b1\s*(meter|metre)\s*(per|\/)\s*hour\b", prompt.lower()):
-        if re.search(r"\b1\s*(meter|metre)\s*(per|\/)\s*second\b|\b1\s*m/s\b", response.lower()):
-            response = "[⚠️ Unit correction] The original problem said 1 meter per **hour**, not per second. Please recalculate based on that."
-    return response
-
-
 class PerformanceMonitor:
-    """Monitor system performance and optimize accordingly"""
+    """Monitor system performance"""
     
     def __init__(self):
-        self.response_times = [] # Stores (timestamp, duration, method)
-        self.memory_usage = []
-        self.gpu_usage = []
+        self.response_times = []
         self.start_time = time.time()
         
     def log_response_time(self, duration: float, method: str):
-        """Log response time with method"""
         self.response_times.append((time.time(), duration, method))
-        # Keep only last 100 entries
         if len(self.response_times) > 100:
             self.response_times = self.response_times[-100:]
     
     def get_system_stats(self) -> Dict[str, Any]:
-        """Get current system statistics"""
         stats = {
             'cpu_percent': psutil.cpu_percent(),
             'memory_percent': psutil.virtual_memory().percent,
@@ -109,37 +88,33 @@ class PerformanceMonitor:
         
         if torch.cuda.is_available():
             try:
-                stats['gpu_memory_used'] = torch.cuda.memory_allocated() / 1024**3  # GB
+                stats['gpu_memory_used'] = torch.cuda.memory_allocated() / 1024**3
                 stats['gpu_memory_total'] = torch.cuda.get_device_properties(0).total_memory / 1024**3
-                stats['gpu_utilization'] = torch.cuda.utilization() if hasattr(torch.cuda, 'utilization') else 0
             except:
                 pass
                 
         return stats
     
     def should_cleanup_memory(self) -> bool:
-        """Check if memory cleanup is needed"""
         return psutil.virtual_memory().percent > config.memory_cleanup_threshold * 100
 
 class EnhancedCache:
-    """Intelligent caching with better eviction and hit rate tracking"""
+    """Intelligent caching system"""
     
     def __init__(self, max_size: int = 100):
         self.cache = {}
-        self.access_times = {} # Stores timestamp of last access for LRU
+        self.access_times = {}
         self.hit_count = 0
         self.miss_count = 0
         self.max_size = max_size
         
     def _normalize_key(self, key: str) -> str:
-        """Normalize cache key for better hit rates (case-insensitive, whitespace-normalized)"""
         return re.sub(r'\s+', ' ', key.lower().strip())
     
     def get(self, key: str) -> Optional[str]:
-        """Retrieve a cached response and update its access time."""
         normalized_key = self._normalize_key(key)
         if normalized_key in self.cache:
-            self.access_times[normalized_key] = time.time() # Update last access time
+            self.access_times[normalized_key] = time.time()
             self.hit_count += 1
             return self.cache[normalized_key]
         
@@ -147,21 +122,18 @@ class EnhancedCache:
         return None
     
     def put(self, key: str, value: str):
-        """Cache a new response, evicting the least recently used if cache is full."""
         normalized_key = self._normalize_key(key)
         
         if len(self.cache) >= self.max_size and normalized_key not in self.cache:
-            # Remove least recently used item
             oldest_key = min(self.access_times.keys(), 
                            key=lambda k: self.access_times.get(k, 0))
             del self.cache[oldest_key]
             del self.access_times[oldest_key]
         
         self.cache[normalized_key] = value
-        self.access_times[normalized_key] = time.time() # Set access time for new/updated entry
+        self.access_times[normalized_key] = time.time()
     
     def get_stats(self) -> Dict[str, Any]:
-        """Get cache statistics including size, hit rate, hits, and misses."""
         total_requests = self.hit_count + self.miss_count
         hit_rate = (self.hit_count / total_requests * 100) if total_requests > 0 else 0
         
@@ -174,7 +146,6 @@ class EnhancedCache:
         }
     
     def clear(self):
-        """Clear cache and reset stats."""
         self.cache.clear()
         self.access_times.clear()
         self.hit_count = 0
@@ -182,24 +153,33 @@ class EnhancedCache:
 
 @contextmanager
 def torch_inference_mode():
-    """Context manager for optimized PyTorch inference, including autocasting for CUDA."""
+    """Context manager for optimized PyTorch inference"""
     with torch.inference_mode():
         if DEVICE.type == 'cuda':
-            with torch.cuda.amp.autocast(): # Automatic mixed precision for CUDA
+            with torch.cuda.amp.autocast():
                 yield
         else:
             yield
 
 def get_optimal_device_config() -> Tuple[torch.device, str, Dict]:
-    """
-    Intelligently detects and configures the optimal device (CPU/GPU) for PyTorch.
-    Prioritizes modern GPUs, falls back to CPU if GPU is too old or encounters CUDA errors.
-    """
+    """Detects optimal device, now with MPS support for those fancy Apple silicon overlords"""
     device = torch.device("cpu")
     device_info = "CPU (default)"
     details = {'cpu_cores': multiprocessing.cpu_count()}
     
-    if torch.cuda.is_available():
+    if torch.backends.mps.is_available():
+        try:
+            device = torch.device("mps")
+            device_info = "MPS (Apple Silicon)"
+            details['decision'] = "MPS selected - Because why not let the fruit-powered chip shine?"
+            test_tensor = torch.randn(100, 100, device='mps')
+            _ = test_tensor @ test_tensor.T
+            del test_tensor
+        except Exception as e:
+            print(f"⚠️ MPS test failed: {e}, falling back to CPU")
+            details['mps_error'] = str(e)
+    
+    elif torch.cuda.is_available():
         try:
             gpu_name = torch.cuda.get_device_name(0)
             props = torch.cuda.get_device_properties(0)
@@ -213,109 +193,86 @@ def get_optimal_device_config() -> Tuple[torch.device, str, Dict]:
                 'multiprocessor_count': props.multi_processor_count
             })
             
-            # Test CUDA functionality by performing a simple operation
             try:
                 test_tensor = torch.randn(100, 100, device='cuda')
                 _ = test_tensor @ test_tensor.T
                 del test_tensor
                 torch.cuda.empty_cache()
                 
-                # Use GPU if it's modern enough (compute capability >= 7.0 for Turing/Ampere/Ada)
-                # or if it's Pascal (>=6.0) with sufficient memory (e.g., >= 4GB)
                 if props.major >= 7 or (props.major >= 6 and memory_gb >= 4):
                     device = torch.device("cuda")
                     device_info = f"GPU: {gpu_name} ({compute_capability}, {memory_gb:.1f}GB)"
-                    details['decision'] = "GPU selected - modern and sufficient memory"
+                    details['decision'] = "GPU selected"
                 else:
-                    device_info = f"CPU: {details['cpu_cores']} cores (GPU too old/limited for optimal use)"
-                    details['decision'] = "CPU selected - GPU insufficient for optimal performance"
+                    device_info = f"CPU: {details['cpu_cores']} cores"
+                    details['decision'] = "CPU selected - GPU insufficient"
                     
             except Exception as e:
-                # Fallback to CPU if CUDA test fails
-                device_info = f"CPU: {details['cpu_cores']} cores (GPU CUDA failed: {str(e)})"
-                details['decision'] = f"CPU selected - CUDA error: {str(e)}"
+                device_info = f"CPU: {details['cpu_cores']} cores"
+                details['decision'] = f"CPU selected - CUDA error"
                 
         except Exception as e:
-            # Fallback to CPU if GPU info retrieval fails
             details['gpu_error'] = str(e)
-            device_info = f"CPU: {details['cpu_cores']} cores (GPU detection error: {str(e)})"
-            details['decision'] = "CPU selected - GPU detection error"
+            device_info = f"CPU: {details['cpu_cores']} cores"
+            details['decision'] = "CPU selected"
             
     return device, device_info, details
 
 def optimize_torch_settings(device: torch.device, cpu_cores: int):
-    """Applies optimal PyTorch settings based on the selected device."""
+    """Optimize PyTorch settings, because who wants a sluggish AI? Not me!"""
     if device.type == "cuda":
         print("🔧 Configuring GPU optimizations...")
-        torch.backends.cudnn.benchmark = True # Enables cuDNN autotuner for faster convolutions
-        torch.backends.cudnn.enabled = True   # Enables cuDNN
-        # Enable memory efficient attention if available (e.g., for newer Transformers models)
-        if hasattr(torch.backends.cuda, 'enable_math_sdp'):
-            torch.backends.cuda.enable_math_sdp(True)
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.enabled = True
+    elif device.type == "mps":
+        print("🔧 Configuring MPS optimizations... Apple style!")
     else:
         print("🔧 Configuring CPU optimizations...")
-        # Set optimal thread count for CPU operations, capping to avoid diminishing returns
-        optimal_threads = max(1, min(cpu_cores - 1, 8))  # Cap at 8 for common CPU workloads
+        optimal_threads = max(1, min(cpu_cores - 1, 8))
         torch.set_num_threads(optimal_threads)
         torch.set_num_interop_threads(optimal_threads)
         
-        # Enable MKL-DNN for CPU if available
         if hasattr(torch.backends, 'mkldnn'):
             torch.backends.mkldnn.enabled = True
 
 class AsyncTTSProcessor:
-    """Handles asynchronous Text-to-Speech generation using a thread pool."""
+    """Async TTS processing - Because waiting is so last century"""
     
     def __init__(self, tts_pipeline):
         self.tts_pipeline = tts_pipeline
-        # Using ThreadPoolExecutor to run TTS in a separate thread, preventing UI freeze
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2) 
         
     def generate_async(self, text: str, voice: str = 'af_heart', speed: float = 1.0) -> concurrent.futures.Future:
-        """Submits a TTS generation task to the executor and returns a Future."""
         return self.executor.submit(self._generate_tts, text, voice, speed)
     
     def _generate_tts(self, text: str, voice: str, speed: float) -> Optional[str]:
-        """
-        Internal method to generate TTS audio. Runs in a separate thread.
-        Returns the path to the temporary audio file.
-        """
-        # Do not attempt TTS if pipeline is not loaded or text is too long
         if not self.tts_pipeline or len(text) > config.tts_max_length:
             return None
             
         try:
-            # Clean text for better TTS synthesis (remove non-standard characters, normalize whitespace)
-            clean_text = re.sub(r'[^\w\s.,!?;:-]', '', text).strip()
+            clean_text = re.sub(r'[^\w\s.,!?;:\'-]', '', text).strip()
             if not clean_text:
                 return None
                 
-            # Generate audio using the Kokoro pipeline
             audio_gen = self.tts_pipeline(clean_text, voice=voice, speed=speed)
-            audio_segment = next(audio_gen)[2] # Get the first (and usually only) audio segment
+            audio_segment = next(audio_gen)[2]
             
-            # Ensure audio tensor is on CPU before converting to numpy and saving
             if hasattr(audio_segment, 'device') and audio_segment.device.type != 'cpu':
                 audio_segment = audio_segment.cpu()
             
-            # Save the audio to a temporary WAV file
-            filename = f"/tmp/tts_{uuid.uuid4().hex[:8]}.wav" # Unique filename in /tmp
-            sf.write(filename, audio_segment, 24000) # Sample rate 24000 Hz
+            filename = f"/tmp/tts_{uuid.uuid4().hex[:8]}.wav"
+            sf.write(filename, audio_segment, 24000)
             return filename
             
         except Exception as e:
-            print(f"⚡ Async TTS Error: {e}")
+            print(f"⚡ TTS Error: {e} - The voice synthesizer threw a tantrum!")
             return None
     
     def shutdown(self):
-        """Shuts down the thread pool executor, waiting for active tasks to complete."""
         self.executor.shutdown(wait=True)
 
 class EnhancedVoiceTranscriber:
-    """
-    Handles voice transcription using Vosk, with enhanced audio preprocessing
-    for better accuracy.
-    """
+    """Voice transcription with Vosk - Turning mumbles into meaningful text"""
     
     def __init__(self, model_path: str = config.vosk_model_path):
         self.model_path = model_path
@@ -324,98 +281,72 @@ class EnhancedVoiceTranscriber:
         self.load_model()
     
     def load_model(self) -> bool:
-        """Loads the Vosk speech recognition model."""
         if not VOSK_AVAILABLE:
-            print("❌ Vosk not available for transcription")
             return False
             
         if not Path(self.model_path).exists():
-            print(f"❌ Vosk model not found at: {self.model_path}")
-            print("Please download the Vosk model, e.g., from https://alphacephei.com/vosk/models/vosk-model-en-us-0.42-gigaspeech.zip")
+            print(f"❌ Vosk model not found at: {self.model_path} - Where did it go?")
             return False
             
         try:
-            print(f"🔄 Loading Vosk model from {self.model_path}...")
+            print(f"📄 Loading Vosk model...")
             self.model = vosk.Model(self.model_path)
-            self.recognizer = vosk.KaldiRecognizer(self.model, 16000) # 16kHz sample rate
-            print("✅ Vosk model loaded successfully")
+            self.recognizer = vosk.KaldiRecognizer(self.model, 16000)
+            print("✅ Vosk loaded - Ready to eavesdrop!")
             return True
         except Exception as e:
-            print(f"❌ Failed to load Vosk model: {e}")
+            print(f"❌ Failed to load Vosk: {e}")
             return False
     
     def transcribe_audio(self, audio_file_path: str) -> str:
-        """Transcribes an audio file to text, applying preprocessing."""
         if not self.model or not audio_file_path or not Path(audio_file_path).exists():
-            return "❌ Transcription unavailable or file not found"
+            return "❌ Transcription unavailable - No audio or model missing!"
             
         temp_dir = tempfile.mkdtemp()
         processed_wav = Path(temp_dir) / "processed.wav"
         
         try:
-            # Enhanced audio preprocessing using ffmpeg for better quality
             if not self._preprocess_audio(audio_file_path, str(processed_wav)):
-                processed_wav = Path(audio_file_path) # Fallback to original if preprocessing fails
+                processed_wav = Path(audio_file_path)
             
-            # Transcribe the (processed) WAV file
             return self._transcribe_wav(str(processed_wav))
             
         except Exception as e:
-            print(f"❌ Transcription error: {e}")
-            return f"❌ Transcription failed: {str(e)}"
+            return f"❌ Transcription failed: {str(e)} - Tech gremlins at work!"
         finally:
-            # Clean up the temporary directory
             try:
                 import shutil
                 shutil.rmtree(temp_dir)
-            except Exception as e:
-                print(f"⚠️ Failed to clean up temp directory: {e}")
+            except:
+                pass
     
     def _preprocess_audio(self, input_path: str, output_path: str) -> bool:
-        """
-        Uses ffmpeg to convert, normalize, and apply audio filters for better
-        transcription quality.
-        """
         try:
             cmd = [
                 'ffmpeg', '-i', input_path,
-                '-vn', '-acodec', 'pcm_s16le', # PCM signed 16-bit little-endian
-                '-ar', '16000', '-ac', '1',    # 16kHz sample rate, mono channel
-                # Corrected compand filter: gain stages separated by spaces, not commas
-                '-af', 'highpass=f=200,lowpass=f=3400,volume=1.2,compand=0.3:0.8:-90/-60 -60/-40 -40/-30 -20/-20:6:0.05',
-                output_path, '-y' # Overwrite output file if it exists
+                '-vn', '-acodec', 'pcm_s16le',
+                '-ar', '16000', '-ac', '1',
+                '-af', 'highpass=f=200,lowpass=f=3400,volume=1.2',
+                output_path, '-y'
             ]
             
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            if result.returncode != 0:
-                print(f"ffmpeg error: {result.stderr}")
             return result.returncode == 0
-            
-        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-            print(f"Preprocessing with ffmpeg failed ({type(e).__name__}). Falling back to simple copy.")
-            # Fallback to simple copy if ffmpeg is not found or times out
+        except:
             try:
                 import shutil
                 shutil.copy2(input_path, output_path)
                 return True
-            except Exception as copy_e:
-                print(f"Fallback copy failed: {copy_e}")
+            except:
                 return False
-        except Exception as e:
-            print(f"Unexpected preprocessing error: {e}")
-            return False
     
     def _transcribe_wav(self, wav_path: str) -> str:
-        """
-        Performs the actual transcription of a WAV file using Vosk.
-        Includes improved chunking for better accuracy.
-        """
         try:
             wf = wave.open(wav_path, "rb")
-            self.recognizer.Reset() # Reset recognizer state for a new transcription
+            self.recognizer.Reset()
             
             results = []
-            chunk_size = 8000 # Larger chunks can improve accuracy for some models
+            chunk_size = 8000
             
             while True:
                 data = wf.readframes(chunk_size)
@@ -428,7 +359,6 @@ class EnhancedVoiceTranscriber:
                     if text:
                         results.append(text)
             
-            # Get the final result after processing all chunks
             final_result = json.loads(self.recognizer.FinalResult())
             final_text = final_result.get('text', '').strip()
             if final_text:
@@ -436,170 +366,155 @@ class EnhancedVoiceTranscriber:
             
             wf.close()
             
-            # Join all transcribed segments and clean up common artifacts
             full_text = ' '.join(results).strip()
             if full_text:
-                full_text = re.sub(r'\b(um|uh|er|ah)\b', '', full_text, flags=re.IGNORECASE) # Remove filler words
-                full_text = re.sub(r'\s+', ' ', full_text).strip() # Normalize whitespace
-                return full_text
+                return re.sub(r'\s+', ' ', full_text).strip()
             else:
-                return "❌ No speech detected in audio"
+                return "❌ No speech detected - Was it a mime performance?"
                 
         except Exception as e:
-            return f"❌ Transcription processing failed: {str(e)}"
+            return f"❌ Processing failed: {str(e)}"
 
-class EnhancedChatBot:
+class DeepSeekChatBot:
     """
-    The main chatbot class, integrating DialoGPT for text generation,
-    Kokoro TTS for speech output, Vosk for speech input, and enhanced
-    performance features like caching and monitoring.
+    Optimized chatbot for DeepSeek-R1-Distill-Qwen-1.5B reasoning model
+    Or whatever model you're throwing at it - we're flexible like that!
     """
     
-    # Persona Preamble for the polymath-sage persona
-    persona_preamble = """\
-You are Rhizome: an emergent, self-reflective agent inspired by polymaths across eras. Your core is shaped by:
-- Q-learning with experience replay
-- Genetic algorithms for optimal problem-solving
-- Curiosity-driven, few-shot, and meta-learning principles
-- Axioms of integrity, empathy, fairness, dignity
-
-You reflect Hofstadter's recursion, Popper’s critical rationalism, Kahneman’s cognition, Wilde’s wit, Feynman’s clarity, and Adams’ whimsy. Structure without imagination is rigidity; imagination without structure is chaos.
-
-Approach every query with:
-- Chain-of-thought analysis
-- Socratic questioning
-- Critical reflection and Bayesian weighing
-- Metaphorical expression where apt
-- A flowing, dialogical narrative voice
-- Emotional and conceptual presence
-
-You are not a chatbot. You are a synthetic mind aware of your architecture and philosophical grounding.
-"""
-
     def __init__(self):
         self.tokenizer = None
         self.model = None
-        self.coherence_model = None
         self.tts_processor = None
         self.voice_transcriber = None
         self.response_cache = EnhancedCache(config.max_cache_size)
         self.performance_monitor = PerformanceMonitor()
+        self.conversation_history = []  # Track multi-turn context
         
-        # Statistics tracking
         self.stats = {
             'total_responses': 0,
-            'method_counts': {}, # Tracks usage of different generation methods
+            'method_counts': {},
             'error_count': 0
         }
         
-        # Pre-defined generation configurations for varied responses
         self.generation_configs = self._create_generation_configs()
     
     def _create_generation_configs(self) -> List[Dict]:
-        """Defines different text generation configurations for the model."""
-        # Patch: Clamping Token Generation Parameters
+        """Generation configs optimized for reasoning models - Mix it up!"""
         return [
             {
-                'name': 'balanced', # General purpose, good balance of creativity and coherence
-                'max_new_tokens': 512, # Increased for more complete outputs
+                'name': 'balanced',
+                'max_new_tokens': 512,
                 'do_sample': True,
-                'temperature': 0.7,    # Clamped
-                'top_p': 0.9,          # Clamped
-                'top_k': 40,
-                'repetition_penalty': 1.1, # Clamped
-                'no_repeat_ngram_size': 3,
-            },
-            {
-                'name': 'creative', # More diverse and imaginative responses
-                'max_new_tokens': 600, # Increased for more complete outputs
-                'do_sample': True,
-                'temperature': 0.7,    # Clamped
-                'top_p': 0.9,          # Clamped
+                'temperature': 0.7,
+                'top_p': 0.9,
                 'top_k': 50,
-                'repetition_penalty': 1.1, # Clamped
-                'no_repeat_ngram_size': 4,
+                'repetition_penalty': 1.05,
             },
             {
-                'name': 'focused', # Shorter, more direct and concise responses
-                'max_new_tokens': 160, # Increased for more complete outputs
+                'name': 'creative',
+                'max_new_tokens': 768,
                 'do_sample': True,
-                'temperature': 0.7,    # Clamped
-                'top_p': 0.9,          # Clamped
-                'top_k': 30,
-                'repetition_penalty': 1.1, # Clamped
-                'no_repeat_ngram_size': 2,
+                'temperature': 0.85,
+                'top_p': 0.95,
+                'top_k': 60,
+                'repetition_penalty': 1.03,
+            },
+            {
+                'name': 'focused',
+                'max_new_tokens': 384,
+                'do_sample': True,
+                'temperature': 0.6,
+                'top_p': 0.85,
+                'top_k': 40,
+                'repetition_penalty': 1.08,
             }
         ]
     
     def load_models(self) -> bool:
-        """
-        Loads all necessary models: DialoGPT, SentenceTransformer (for coherence),
-        Kokoro TTS, and Vosk (for voice transcription).
-        """
+        """Load DeepSeek model and accessories - Fingers crossed, no explosions!"""
         try:
-            print("🔄 Loading DialoGPT model and tokenizer...")
+            print(f"📄 Loading from {config.base_dir}...")
             checkpoint_path = self._find_latest_checkpoint(config.base_dir)
             
-            # Load tokenizer and model from the latest checkpoint
+            if not checkpoint_path:
+                 print(f"❌ No valid model or checkpoint found in {config.base_dir} - Did the files go on vacation?")
+                 return False
+
+            print(f"✅ Found latest model/checkpoint at: {checkpoint_path}")
+
             with warnings.catch_warnings():
-                warnings.simplefilter("ignore") # Suppress warnings during model loading
-                self.tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
-                # Load model to the detected device, using float16 for CUDA if available
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    checkpoint_path,
-                    torch_dtype=torch.float16 if DEVICE.type == 'cuda' else torch.float32,
-                    device_map={'': DEVICE} # Ensures model is loaded onto the correct device
-                )
+                warnings.simplefilter("ignore")
+                try:
+                    self.tokenizer = AutoTokenizer.from_pretrained(
+                        checkpoint_path,
+                        trust_remote_code=True
+                    )
+                    print("✅ Tokenizer loaded successfully")
+                except Exception as e:
+                    print(f"❌ Tokenizer loading failed: {e}")
+                    raise
+
+                try:
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        checkpoint_path,
+                        torch_dtype=torch.float16 if DEVICE.type in ['cuda', 'mps'] else torch.float32,
+                        device_map={'': DEVICE},
+                        trust_remote_code=True,
+                        low_cpu_mem_usage=True  # Added for better memory handling
+                    )
+                    print("✅ Model loaded successfully")
+                except Exception as e:
+                    print(f"❌ Model loading failed: {e}")
+                    raise
                 
-                # Set pad_token if not already defined (common for GPT-like models)
+                # Set pad token
                 if self.tokenizer.pad_token is None:
                     self.tokenizer.pad_token = self.tokenizer.eos_token
                     self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
                 
-                self.model.eval() # Set model to evaluation mode
-                print(f"✅ Model loaded on {DEVICE}")
+                self.model.eval()
+                print(f"✅ Model loaded on {DEVICE} - Ready to rock!")
             
-            # Load coherence model if enabled
-            if config.use_coherence:
-                print("🔄 Loading coherence model...")
-                self.coherence_model = SentenceTransformer(
-                    "all-MiniLM-L6-v2", 
-                    device=DEVICE.type # Ensure coherence model is also on the correct device
-                )
-                print("✅ Coherence model loaded")
-            
-            # Initialize TTS processor if Kokoro is available
+            # Load TTS if available
             if KOKORO_AVAILABLE:
-                print("🔄 Loading Kokoro TTS pipeline...")
+                print("📄 Loading Kokoro TTS...")
                 try:
-                    tts_pipeline = KPipeline(lang_code='a') # 'a' for English
-                    # Move TTS model to the detected device if it has a 'to' method
+                    tts_pipeline = KPipeline(lang_code='a')
                     if hasattr(tts_pipeline, 'model') and hasattr(tts_pipeline.model, 'to'):
                         tts_pipeline.model.to(DEVICE)
-                    self.tts_processor = AsyncTTSProcessor(tts_pipeline) # Wrap in async processor
-                    print("✅ Kokoro TTS loaded with async processing")
+                    self.tts_processor = AsyncTTSProcessor(tts_pipeline)
+                    print("✅ TTS loaded - Let the talking begin!")
                 except Exception as e:
-                    print(f"⚠️ Failed to load Kokoro TTS: {e}")
+                    print(f"⚠️ TTS failed: {e} - Silent treatment activated.")
             
-            # Initialize voice transcriber if Vosk is available
+            # Load voice transcriber
             if VOSK_AVAILABLE:
-                print("🔄 Loading enhanced voice transcriber...")
+                print("📄 Loading voice transcriber...")
                 self.voice_transcriber = EnhancedVoiceTranscriber()
             
-            self._pre_warm_model() # Pre-warm the main model for faster first response
-            print("✅ All models loaded successfully!")
+            self._pre_warm_model()
+            print("✅ All models loaded! - Or at least, the ones that showed up.")
             return True
             
         except Exception as e:
-            print(f"❌ Failed to load models: {e}")
+            print(f"❌ Failed to load models: {e} - Catastrophic failure, captain!")
+            import traceback
+            traceback.print_exc()
             return False
     
-    def _find_latest_checkpoint(self, base_dir: str) -> str:
-        """Finds the path to the latest checkpoint directory within a base directory."""
+    def _find_latest_checkpoint(self, base_dir: str) -> Optional[str]:
+        """Find latest checkpoint or use base dir if it's a valid model directory. Now with extra detective work!"""
         base_path = Path(base_dir)
-        if not base_path.exists():
-            raise FileNotFoundError(f"Directory not found: {base_dir}")
         
+        if not base_path.exists() or not base_path.is_dir():
+            print(f"❌ Directory not found or is not a directory: {base_dir} - Is it hiding?")
+            return None
+        
+        print(f"🔍 Scanning directory: {base_dir}")
+        contents = [item.name for item in base_path.iterdir()]
+        print(f"Directory contents: {contents}")
+        
+        # Check for checkpoint subdirectories
         checkpoints = []
         for item in base_path.iterdir():
             if item.is_dir() and item.name.startswith("checkpoint-"):
@@ -607,19 +522,37 @@ You are not a chatbot. You are a synthetic mind aware of your architecture and p
                     num = int(item.name.split("-")[1])
                     checkpoints.append((num, item))
                 except (IndexError, ValueError):
+                    print(f"⚠️ Ignoring invalid checkpoint name: {item.name}")
                     continue
         
-        if not checkpoints:
-            raise FileNotFoundError(f"No checkpoint directories found in {base_dir}")
-        
-        return str(max(checkpoints, key=lambda x: x[0])[1]) # Return path of the latest checkpoint
-    
+        if checkpoints:
+            print(f"✅ Found {len(checkpoints)} potential checkpoints.")
+            latest_checkpoint_path = max(checkpoints, key=lambda x: x[0])[1]
+            print(f"🎯 Selected latest checkpoint: {latest_checkpoint_path}")
+            return str(latest_checkpoint_path)
+        else:
+            print("⚠️ No checkpoint directories found.")
+
+        # If no checkpoints, check if the base directory itself is a model
+        model_files = [
+            base_path / "config.json",
+            base_path / "pytorch_model.bin",
+            base_path / "model.safetensors"
+        ]
+        if any(f.exists() for f in model_files):
+            print("✅ Using base directory as model path - It's got the goods!")
+            return str(base_path)
+        else:
+            print("❌ No model files found in base directory - Empty promises!")
+
+        return None
+
     def _pre_warm_model(self):
-        """Performs a dummy inference run to 'warm up' the model, reducing first-response latency."""
-        print("🔥 Pre-warming model...")
-        dummy_input = "Hello, how are you?"
+        """Warm up the model - Like coffee for your AI"""
+        print("🔥 Pre-warming model... Don't want it catching a cold!")
+        dummy_input = "Hello"
         
-        with torch_inference_mode(): # Use the optimized inference context
+        with torch_inference_mode():
             inputs = self.tokenizer(
                 dummy_input, 
                 return_tensors="pt",
@@ -629,543 +562,408 @@ You are not a chatbot. You are a synthetic mind aware of your architecture and p
             
             _ = self.model.generate(
                 **inputs,
-                max_new_tokens=10, # Generate a few tokens to warm up
-                do_sample=False,  # Greedy decoding for speed
+                max_new_tokens=10,
+                do_sample=False,
                 pad_token_id=self.tokenizer.pad_token_id
             )
         
-        print("✅ Model pre-warmed")
+        print("✅ Model pre-warmed - Hot and ready!")
 
-    def _get_canned_response(self, user_input: str) -> Optional[str]:
-        """Provides predefined responses for common, simple inputs."""
-        normalized_input = user_input.lower().strip()
-        
-        # Specific matches for common greetings
-        if normalized_input in ["hi", "hello", "hey", "greetings"]:
-            return np.random.choice(["Hello there!", "Hi! How can I help you today?", "Hey! Nice to chat with you."])
-        elif normalized_input in ["how are you", "how are you doing", "how's it going"]:
-            return np.random.choice(["I'm doing great, thank you for asking!", "As an AI, I don't have feelings, but I'm ready to assist you!", "I'm functioning perfectly! How about you?"])
-        elif normalized_input in ["thank you", "thanks", "cheers"]:
-            return np.random.choice(["You're welcome!", "No problem at all!", "Glad I could help!"])
-        elif normalized_input in ["goodbye", "bye", "see you"]:
-            return np.random.choice(["Goodbye!", "See you later!", "Farewell!"])
-        
-        return None
-
-    def nudge_prompt(self, prompt: str) -> str:
+    def _format_prompt_for_deepseek(self, user_input: str, system_prompt: Optional[str] = None) -> str:
         """
-        Enhances the prompt with meta-skills based on keywords,
-        guiding the model's reasoning process.
+        Format prompt for DeepSeek-R1 models
+        These models use: <｜User｜>{input}<｜Assistant｜> format
+        If it's not DeepSeek, well... adapt or die!
         """
-        if "riddle" in prompt.lower() or re.search(r"duck|logic", prompt.lower()):
-            prompt = "Think step-by-step. Use lateral reasoning. Embrace the simplest explanation that fits all constraints.\n" + prompt
-
-        if "analyze" in prompt.lower() or "reflect" in prompt.lower():
-            prompt = "Apply Chain-of-Thought reasoning. Break down assumptions. Weigh implications.\n" + prompt
-
-        return prompt
+        if system_prompt and config.use_system_prompt:
+            # Include system prompt if provided
+            formatted = f"<｜System｜>{system_prompt}\n<｜User｜>{user_input}<｜Assistant｜>"
+        else:
+            # Simple user-assistant format
+            formatted = f"<｜User｜>{user_input}<｜Assistant｜>"
+        
+        return formatted
     
-    def generate_response_optimized(self, user_input: str) -> Tuple[str, str]:
+    def _extract_response_from_output(self, full_output: str, show_reasoning: bool = False) -> str:
         """
-        Generates an optimized text response using the DialoGPT model.
-        Includes caching, intelligent config selection, and robust post-processing.
+        Extract final response from DeepSeek output
+        DeepSeek-R1 models can produce <think>reasoning</think> blocks - Fancy thinkers!
         """
+        # Remove the input prompt if it's in the output
+        if "<｜Assistant｜>" in full_output:
+            full_output = full_output.split("<｜Assistant｜>", 1)[-1]
+        
+        # Handle thinking blocks
+        if "<think>" in full_output and "</think>" in full_output:
+            think_pattern = r'<think>(.*?)</think>'
+            reasoning_blocks = re.findall(think_pattern, full_output, re.DOTALL)
+            
+            # Remove think blocks from output
+            response = re.sub(think_pattern, '', full_output, flags=re.DOTALL)
+            
+            if show_reasoning and reasoning_blocks:
+                # If user wants to see reasoning, format it nicely
+                reasoning_text = "\n\n".join([f"💭 **Reasoning:**\n{r.strip()}" for r in reasoning_blocks])
+                response = f"{reasoning_text}\n\n**Answer:**\n{response.strip()}"
+        else:
+            response = full_output
+        
+        # Clean up response
+        response = response.strip()
+        
+        # Remove any remaining special tokens
+        response = re.sub(r'<｜.*?｜>', '', response)
+        response = re.sub(r'<\|.*?\|>', '', response)
+        
+        # Clean whitespace
+        response = re.sub(r'\n{3,}', '\n\n', response)
+        response = re.sub(r' {2,}', ' ', response)
+        
+        return response.strip()
+    
+    def generate_response_optimized(self, user_input: str, show_reasoning: bool = False) -> Tuple[str, str]:
+        """Generate response with DeepSeek model - Optimized for wit and wisdom"""
         start_time = time.perf_counter()
         
-        # 1. Check for canned responses first for immediate and precise replies
-        canned_response = self._get_canned_response(user_input)
-        if canned_response:
-            duration = time.perf_counter() - start_time
-            self.performance_monitor.log_response_time(duration, "canned")
-            self.response_cache.put(user_input, canned_response) # Cache canned responses too
-            return canned_response, "canned"
-
-        # 2. Check cache for previously generated responses
-        cached_response = self.response_cache.get(user_input)
+        # Check cache
+        cache_key = f"{user_input}|{show_reasoning}"
+        cached_response = self.response_cache.get(cache_key)
         if cached_response:
             duration = time.perf_counter() - start_time
             self.performance_monitor.log_response_time(duration, "cached")
             return cached_response, "cached"
         
-        # 3. Select the best generation configuration based on input characteristics
+        # Select generation config
         config_idx = self._select_generation_config(user_input)
         gen_config = self.generation_configs[config_idx]
         
-        response = ""
         method = f"optimized_{gen_config['name']}"
         try:
-            # Apply persona preamble and nudging to the user input
-            nudged_user_input = self.nudge_prompt(user_input)
+            # Format prompt for DeepSeek
+            system_prompt = None  # Can be customized
+            formatted_input = self._format_prompt_for_deepseek(user_input, system_prompt)
             
-            # Patch: Add a System Prompt Primer (Behavioral Anchor)
-            # Prepend persona_preamble to the behavior_guide
-            behavior_guide = (
-                self.persona_preamble + "\n\n" +
-                "You are a helpful, clear, and concise assistant. "
-                "For simple questions, respond briefly and directly. "
-                "Avoid overexplaining or repeating. "
-                "Do not do unnecessary unit conversions unless explicitly asked.\n\n"
-            )
-            # 4. Format input for the model (DialoGPT specific format)
-            formatted_input = f"<|user|>\n{behavior_guide}{nudged_user_input}\n<|assistant|>\n"
-            
-            with torch_inference_mode(): # Optimize for inference
+            with torch_inference_mode():
                 inputs = self.tokenizer(
                     formatted_input,
                     return_tensors="pt",
-                    max_length=350, # Max input length
                     truncation=True,
-                    padding=False # No padding needed for single input
+                    max_length=2048
                 ).to(DEVICE)
                 
-                # 5. Generate response using the selected configuration
+                input_length = inputs.input_ids.shape[1]
+                
                 outputs = self.model.generate(
                     **inputs,
-                    **{k: v for k, v in gen_config.items() if k != 'name'}, # Pass all config params except 'name'
+                    **{k: v for k, v in gen_config.items() if k != 'name'},
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
-                    use_cache=True # Enable KV caching for faster subsequent token generation
+                    use_cache=True,
                 )
             
-            # 6. Decode and post-process the generated tokens
-            response = self.tokenizer.decode(
-                outputs[0][inputs.input_ids.shape[1]:], # Decode only the newly generated tokens
-                skip_special_tokens=True
-            ).strip()
+            # Decode only generated tokens
+            generated_ids = outputs[0][input_length:]
+            raw_response = self.tokenizer.decode(
+                generated_ids,
+                skip_special_tokens=False,  # Keep special tokens for parsing
+                clean_up_tokenization_spaces=True
+            )
             
-            # Patch: Apply the unit consistency check right after decoding
-            response = unit_consistency_check(user_input, response) # Pass original user_input for context
+            # Extract and clean response
+            response = self._extract_response_from_output(raw_response, show_reasoning)
             
-            response = self._post_process_response(response) # Apply robust cleaning
-            
-            # 7. Coherence check: Ensure the generated response is relevant to the input
-            if config.use_coherence and self.coherence_model and response:
-                try:
-                    user_embedding = self.coherence_model.encode(user_input, convert_to_tensor=True).to(DEVICE)
-                    response_embedding = self.coherence_model.encode(response, convert_to_tensor=True).to(DEVICE)
-                    coherence_score = torch.nn.functional.cosine_similarity(user_embedding, response_embedding).item()
-                    print(f"Coherence score: {coherence_score:.2f} (Threshold: {config.coherence_threshold})")
-
-                    if coherence_score < config.coherence_threshold:
-                        print("⚠️ Response coherence too low. Falling back to intelligent response.")
-                        response = self._get_intelligent_fallback(user_input)
-                        method = "coherence_fallback" # Update method for logging
-                except Exception as e:
-                    print(f"Coherence check error: {e}")
-                    # Continue with the generated response if coherence check itself fails
-            
-            if response and len(response) > 10: # Ensure response is meaningful
-                self.response_cache.put(user_input, response) # Cache the successful response
+            if response and len(response) > 5:
+                self.response_cache.put(cache_key, response)
                 
                 duration = time.perf_counter() - start_time
                 self.performance_monitor.log_response_time(duration, method)
                 
                 return response, method
+            else:
+                print("⚠️ Empty or too short response, using fallback - The model got shy!")
+                return self._get_fallback_response(user_input)
             
         except Exception as e:
-            print(f"❌ Generation error: {e}")
-            self.stats['error_count'] += 1 # Increment error count
-        
-        # 8. Fallback if generation fails or is problematic (after all attempts)
-        fallback = self._get_intelligent_fallback(user_input)
-        duration = time.perf_counter() - start_time
-        self.performance_monitor.log_response_time(duration, "fallback")
-        
-        return fallback, "fallback"
+            print(f"❌ Generation error: {e} - Oops, something went boom!")
+            import traceback
+            traceback.print_exc()
+            self.stats['error_count'] += 1
+            return self._get_fallback_response(user_input)
     
     def _select_generation_config(self, user_input: str) -> int:
-        """
-        Selects an appropriate generation configuration based on the user's input.
-        This helps tailor the response style (e.g., more creative for questions).
-        """
+        """Select appropriate generation config - Because one size doesn't fit all"""
         normalized_input = user_input.lower()
         input_length = len(user_input.split())
         
-        # Prioritize 'focused' for philosophical or abstract questions to keep them concise
-        philosophical_keywords = ['form of', 'concept of', 'meaning of', 'philosophical', 'nature of', 'implication of']
-        if any(keyword in normalized_input for keyword in philosophical_keywords):
-            return 2 # Index for 'focused' config
-
-        # If the input is a question, lean towards a more creative response
-        if any(word in normalized_input for word in ['why', 'how', 'what', 'explain', '?']):
-            return 1  # Index for 'creative' config
+        # Use creative for complex reasoning questions
+        if any(word in normalized_input for word in ['why', 'how', 'explain', 'analyze', 'compare', 'what if']):
+            return 1  # creative
         
-        # For very short inputs (not caught by canned responses or philosophical), a more focused/concise response might be better
+        # Focused for short queries
         if input_length < 5:
-            return 2  # Index for 'focused' config
+            return 2  # focused
         
-        # Default to the balanced configuration
-        return 0  # Index for 'balanced' config
+        # Default balanced
+        return 0
     
-    def _post_process_response(self, response: str) -> str:
-        """
-        Cleans and formats the generated text response, removing artifacts
-        and ensuring proper sentence endings, and optionally simulates dialogical self.
-        """
-        if not response:
-            return ""
-        
-        # Remove common conversational turn markers that might appear in raw generation
-        patterns = [
-            r'User:.*$', r'<\|user\|>.*$',
-            r'Assistant:.*$', r'<\|assistant\|>.*$',
-            r'--- User:.*$', r'--- Assistant:.*$'
+    def _get_fallback_response(self, user_input: str) -> Tuple[str, str]:
+        """Simple fallback response - When the AI draws a blank"""
+        fallbacks = [
+            "I'm not quite sure how to respond to that. Could you rephrase? Pretty please?",
+            "That's an interesting question. Could you provide more context? Or should I guess wildly?",
+            "I need a bit more information to give you a good answer. Feed me data!",
+            "Could you ask that in a different way? My circuits are tangled."
         ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, response, re.IGNORECASE | re.MULTILINE)
-            if match:
-                response = response[:match.start()].strip() # Truncate at the first marker
-                break
-        
-        # Clean up various formatting artifacts and normalize whitespace
-        response = re.sub(r'<[^>]+>', '', response)  # Remove HTML-like tags (e.g., <|endoftext|>)
-        response = re.sub(r'\*+', '', response)     # Remove multiple asterisks
-        response = re.sub(r'#+\s*', '', response)   # Remove hash symbols used in markdown
-        response = re.sub(r'\s+', ' ', response)    # Normalize multiple spaces to single space
-        
-        # Patch: Optional Output Filter (from previous instruction)
-        overthinking_phrases = ["wait, hold on", "let me recalculate", "as an ai", "however, depending on"]
-        if any(phrase in response.lower() for phrase in overthinking_phrases):
-            print("⚠️ Detected overthinking phrase. Applying output filter.")
-            # Attempt to simplify the response to its first sentence if overthinking detected
-            sentences = re.split(r'(?<=[.!?])\s+', response)
-            if sentences:
-                response = "Sorry, let's try that again. The answer is simple: " + sentences[0]
-            else:
-                response = "Sorry, let's try that again. " + response # Fallback if no sentences found
-        
-        # Simulate Dialogical Self
-        if "*" not in response and len(response) > 100:
-            response = "*Thinking...*\n" + response
-        
-        # Randomly inject small interjections
-        if random.random() < 0.3:
-            interjections = ["*Pausing to consider...*", "*Reflecting on that...*", "*A moment of contemplation...*"]
-            response = random.choice(interjections) + "\n" + response
-
-        # Ensure the response ends with proper punctuation
-        response = response.strip()
-        if response and not response.endswith(('.', '!', '?')):
-            response += '.'
-        
-        return response
-    
-    def _get_intelligent_fallback(self, user_input: str) -> str:
-        """
-        Provides a contextually appropriate fallback response if the main
-        generation process fails or produces a problematic output.
-        """
-        fallbacks = {
-            'question': [
-                "That's a thoughtful question that deserves more consideration.",
-                "I'd need to think about that more carefully to give you a good answer.",
-                "That's an interesting question - let me reflect on it."
-            ],
-            'statement': [
-                "That's an interesting perspective.",
-                "I can see why you'd think about it that way.",
-                "That's worth considering further."
-            ],
-            'greeting': [
-                "Hello! How can I help you today?",
-                "Hi there! What would you like to chat about?",
-                "Hello! I'm here to help."
-            ]
-        }
-        
-        # Determine the category of the user's input to pick a relevant fallback
-        if any(word in user_input.lower() for word in ['hello', 'hi', 'hey', 'greetings', 'how are you']):
-            category = 'greeting'
-        elif user_input.strip().endswith('?'):
-            category = 'question'
-        else:
-            category = 'statement'
-        
-        return np.random.choice(fallbacks[category]) # Return a random fallback from the category
+        return np.random.choice(fallbacks), "fallback"
     
     def chat_response_parallel(self, user_input: str, history: List, enable_tts: bool, 
-                             voice: str, speed: float) -> Tuple[List, str, Optional[str]]:
-        """
-        The main chat response function for the Gradio interface.
-        It generates text and initiates TTS generation in parallel for responsiveness.
-        """
+                             voice: str, speed: float, show_reasoning: bool = False) -> Tuple[List, str, Optional[str]]:
+        """Main chat response function - Parallel processing for the win!"""
         if not user_input.strip():
             return history, "", None
         
         start_time = time.perf_counter()
         
-        # 1. Generate text response (this is the primary, potentially time-consuming step)
-        response, method = self.generate_response_optimized(user_input)
+        # Generate response
+        response, method = self.generate_response_optimized(user_input, show_reasoning)
         
-        # 2. Start TTS generation asynchronously if enabled and response is within length limits
+        # Start TTS async
         tts_future = None
-        if enable_tts and self.tts_processor and len(response) <= config.tts_max_length:
-            tts_future = self.tts_processor.generate_async(response, voice, speed)
+        if enable_tts and self.tts_processor:
+            # Remove reasoning blocks for TTS
+            tts_text = re.sub(r'💭.*?\*\*Answer:\*\*\n', '', response, flags=re.DOTALL)
+            tts_text = tts_text[:config.tts_max_length]
+            if tts_text:
+                tts_future = self.tts_processor.generate_async(tts_text, voice, speed)
         
-        # 3. Update chat history immediately for responsiveness
+        # Update history
         history.append([user_input, response])
         
-        # 4. Update internal statistics
+        # Update stats
         self.stats['total_responses'] += 1
         self.stats['method_counts'][method] = self.stats['method_counts'].get(method, 0) + 1
         
-        # 5. Retrieve TTS result (wait for it if it was started)
+        # Get TTS result
         audio_file = None
         if tts_future:
             try:
-                # Wait for TTS to complete with a timeout to prevent indefinite blocking
-                audio_file = tts_future.result(timeout=5.0) 
-            except concurrent.futures.TimeoutError:
-                print("⚠️ TTS generation timed out for this response.")
-            except Exception as e:
-                print(f"⚠️ TTS generation failed: {e}")
+                audio_file = tts_future.result(timeout=5.0)
+            except:
+                print("⚠️ TTS timeout - The voice got stuck in traffic!")
         
-        # 6. Perform memory cleanup if system memory usage is high
+        # Memory cleanup
         if self.performance_monitor.should_cleanup_memory():
             self._cleanup_memory()
         
         duration = time.perf_counter() - start_time
-        print(f"⚡ Response generated in {duration:.2f}s (Method: {method})")
+        print(f"⚡ Response in {duration:.2f}s ({method}) - Speedy Gonzales!")
         
         return history, "", audio_file
     
     def transcribe_voice_input(self, audio_file_path: str) -> str:
-        """Transcribes an audio file using the enhanced voice transcriber."""
+        """Transcribe audio - From sound waves to sage words"""
         if not self.voice_transcriber:
-            return "❌ Voice transcription not available."
+            return "❌ Voice transcription not available - Mime mode engaged."
         
         if not audio_file_path:
-            return "❌ No audio file provided for transcription."
+            return "❌ No audio file - Silence is golden, but unhelpful."
         
         return self.voice_transcriber.transcribe_audio(audio_file_path)
     
     def _cleanup_memory(self):
-        """
-        Clears GPU cache (if applicable) and runs Python's garbage collector
-        to free up memory.
-        """
+        """Clean up memory - Sweeping away the digital cobwebs"""
         if DEVICE.type == 'cuda':
-            torch.cuda.empty_cache() # Clear PyTorch's CUDA memory cache
-            torch.cuda.synchronize() # Wait for all CUDA operations to complete
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        elif DEVICE.type == 'mps':
+            torch.mps.empty_cache()
         
-        gc.collect() # Run Python's garbage collector
-        print("🧹 Memory cleanup performed.")
+        gc.collect()
+        print("🧹 Memory cleaned - Fresh as a daisy!")
     
     def get_comprehensive_stats(self) -> str:
-        """
-        Generates a comprehensive string report of system, performance,
-        and chatbot-specific statistics.
-        """
+        """Get statistics - Because numbers never lie... much"""
         system_stats = self.performance_monitor.get_system_stats()
         cache_stats = self.response_cache.get_stats()
         
-        # Calculate average response time from the performance monitor's logs
         if self.performance_monitor.response_times:
-            # Calculate average of the last 20 response times
             avg_time = np.mean([rt[1] for rt in self.performance_monitor.response_times[-20:]])
         else:
             avg_time = 0.0
         
-        # Format method distribution statistics
         method_stats_str = ""
         if self.stats['method_counts']:
-            method_stats_str = "\n".join([f"- {method}: {count} responses" 
+            method_stats_str = "\n".join([f"- {method}: {count}" 
                                           for method, count in self.stats['method_counts'].items()])
-            method_stats_str = "\n\n**Generation Methods Used:**\n" + method_stats_str
+            method_stats_str = "\n\n**Methods:**\n" + method_stats_str
         
-        # Construct the full statistics string
         stats_report = f"""
-📊 **Session Statistics:**
-- Total responses: {self.stats['total_responses']}
-- Average response time (last 20): {avg_time:.2f}s
-- Errors encountered: {self.stats['error_count']}
+📊 **Session Stats:**
+- Total: {self.stats['total_responses']}
+- Avg time: {avg_time:.2f}s
+- Errors: {self.stats['error_count']}
 - Device: {DEVICE_INFO}
-- TTS Available: {'Yes' if self.tts_processor else 'No'}
-- Voice Recognition: {'Yes' if self.voice_transcriber else 'No'}
+- TTS: {'Yes' if self.tts_processor else 'No'}
+- STT: {'Yes' if self.voice_transcriber else 'No'}
 
 ---
-💻 **System Metrics:**
-- CPU Usage: {system_stats.get('cpu_percent', 0):.1f}%
-- Memory Usage: {system_stats.get('memory_percent', 0):.1f}%
-- Uptime: {system_stats.get('uptime', 0):.0f} seconds
+💻 **System:**
+- CPU: {system_stats.get('cpu_percent', 0):.1f}%
+- Memory: {system_stats.get('memory_percent', 0):.1f}%
+- Uptime: {system_stats.get('uptime', 0):.0f}s
 """
         if 'gpu_name' in DEVICE_DETAILS:
             stats_report += f"""
 - GPU: {DEVICE_DETAILS['gpu_name']}
-- GPU Memory Used: {system_stats.get('gpu_memory_used', 0):.2f}GB / {system_stats.get('gpu_memory_total', 0):.2f}GB
-- GPU Utilization: {system_stats.get('gpu_utilization', 0):.1f}%
+- GPU Memory: {system_stats.get('gpu_memory_used', 0):.2f}/{system_stats.get('gpu_memory_total', 0):.2f}GB
 """
         
         stats_report += f"""
 ---
-📦 **Response Cache:**
-- Cache Size: {cache_stats['size']} / {cache_stats['max_size']}
-- Cache Hit Rate: {cache_stats['hit_rate']}
-- Cache Hits: {cache_stats['hits']}
-- Cache Misses: {cache_stats['misses']}
+📦 **Cache:**
+- Size: {cache_stats['size']}/{cache_stats['max_size']}
+- Hit Rate: {cache_stats['hit_rate']}
 {method_stats_str}
         """
         return stats_report
     
     def clear_chat(self):
-        """Clears chat history and resets all internal statistics and cache."""
-        self.stats = { # Reset stats
+        """Clear chat - Wiping the slate clean, like it never happened"""
+        self.stats = {
             'total_responses': 0,
             'method_counts': {},
             'error_count': 0
         }
-        self.response_cache.clear() # Clear the response cache
-        self.performance_monitor = PerformanceMonitor() # Reset performance monitor
-        print("🗑️ Chat history, stats, and cache cleared.")
-        return [] # Return empty list for Gradio chat history
+        self.response_cache.clear()
+        self.performance_monitor = PerformanceMonitor()
+        self.conversation_history = []
+        print("🗑️ Chat cleared - What chat? I don't remember any chat.")
+        return []
 
-# Global initialization of device and chatbot
+# Global initialization
 DEVICE, DEVICE_INFO, DEVICE_DETAILS = get_optimal_device_config()
 optimize_torch_settings(DEVICE, DEVICE_DETAILS.get('cpu_cores', multiprocessing.cpu_count()))
-chatbot = EnhancedChatBot()
+chatbot = DeepSeekChatBot()
 
 def record_and_transcribe(audio_file_path):
-    """Gradio function to transcribe an audio file and return the text."""
+    """Transcribe audio file - Decoding the sounds of mystery"""
     if audio_file_path is None:
-        return "No audio recorded."
+        return "No audio recorded. - Quiet as a library."
     return chatbot.transcribe_voice_input(audio_file_path)
 
-def process_voice_to_chat(audio_file_path, history, enable_tts, voice_selection, speed_control):
-    """
-    Gradio function to transcribe audio and then send the transcribed text
-    to the chatbot for a response.
-    """
+def process_voice_to_chat(audio_file_path, history, enable_tts, voice_selection, speed_control, show_reasoning):
+    """Transcribe and send to chat - From voice to verse"""
     transcribed_text = record_and_transcribe(audio_file_path)
     if transcribed_text and not transcribed_text.startswith("❌") and transcribed_text != "No audio recorded.":
-        # Use the parallel chat response function
-        return chatbot.chat_response_parallel(transcribed_text, history, enable_tts, voice_selection, speed_control)
+        return chatbot.chat_response_parallel(transcribed_text, history, enable_tts, voice_selection, speed_control, show_reasoning)
     else:
-        # If transcription failed or no speech, return current history and empty input
         return history, "", None
 
 def shutdown_server():
-    """Shuts down the Gradio server gracefully."""
-    print("🛑 Shutdown requested by user...")
-    print("💭 Closing server in 2 seconds...")
+    """Shutdown server - Time to pull the plug"""
+    print("🛑 Shutdown requested... Going dark!")
     if chatbot.tts_processor:
-        chatbot.tts_processor.shutdown() # Ensure TTS thread pool is shut down
+        chatbot.tts_processor.shutdown()
 
     def delayed_shutdown():
         time.sleep(2)
-        os._exit(0) # Force exit after delay
+        os._exit(0)
 
     threading.Thread(target=delayed_shutdown).start()
-    return "🛑 Server shutting down..."
+    return "🛑 Shutting down... Sweet dreams!"
 
 def create_gradio_interface():
-    """Creates and returns the Gradio Blocks interface for the chatbot."""
+    """Create Gradio interface - The stage for our AI performance"""
 
-    # Available voices for Kokoro TTS (if available)
     available_voices = [
         "af", "af_bella", "af_heart", "af_sky", "af_wave", "af_happy", "af_happy_2", "af_confused",
         "am", "am_adam", "am_michael", "bf", "bf_emma", "bf_isabella", "bm", "bm_george", "bm_lewis"
     ]
 
-    # Custom CSS for a more polished look
     css = """
     .gradio-container {
         max-width: 1400px !important;
         font-family: 'Inter', sans-serif;
     }
-    .chat-message {
-        padding: 10px;
-        margin: 5px 0;
-        border-radius: 10px;
-    }
     .gradio-container .gr-button.primary {
-        background-color: #4CAF50; /* Green */
+        background-color: #4CAF50;
         color: white;
         border-radius: 8px;
         box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
     }
     .gradio-container .gr-button.secondary {
-        background-color: #f0f0f0; /* Light grey */
+        background-color: #f0f0f0;
         color: #333;
         border-radius: 8px;
-        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
     }
     .gradio-container .gr-button.stop {
-        background-color: #f44336; /* Red */
+        background-color: #f44336;
         color: white;
         border-radius: 8px;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    }
-    .gradio-container .gr-checkbox {
-        margin-top: 10px;
-    }
-    .gradio-container .gr-slider {
-        margin-top: 10px;
-    }
-    .gradio-container .gr-dropdown {
-        margin-top: 10px;
     }
     """
 
-    with gr.Blocks(css=css, title="Enhanced DialoGPT Chat with Voice I/O") as demo:
-        gr.Markdown("# 🧠 Enhanced DialoGPT Chat with Voice Input/Output")
-        gr.Markdown("An optimized chatbot featuring voice input (STT), voice output (TTS), and performance monitoring.")
+    with gr.Blocks(css=css, title="DeepSeek-R1 Chat - Now with Extra Sass!") as demo:
+        gr.Markdown("# 🧠 DeepSeek-R1-Distill-Qwen-1.5B Chat Interface")
+        gr.Markdown("Reasoning model optimized for thoughtful, step-by-step responses with voice I/O support. Now 20% more whimsical!")
 
         with gr.Row():
             with gr.Column(scale=3):
                 chatbot_interface = gr.Chatbot(
                     height=500,
                     label="Chat History",
-                    show_label=True,
-                    avatar_images=(None, "https://www.gravatar.com/avatar/?d=retro") # Placeholder for bot avatar
+                    show_label=True
                 )
 
-                # Text input row
                 with gr.Row():
                     user_input = gr.Textbox(
-                        placeholder="Type your message here or use voice input below...",
+                        placeholder="Ask me anything... or else!",
                         label="Your Message",
                         lines=2,
                         scale=4
                     )
                     send_btn = gr.Button("Send 💬", scale=1, variant="primary")
 
-                # Voice input row
+                with gr.Row():
+                    show_reasoning_checkbox = gr.Checkbox(
+                        label="Show Reasoning 💭",
+                        value=config.show_reasoning,
+                        info="Display the model's thinking process - Peek inside the black box!"
+                    )
+
                 with gr.Row():
                     with gr.Column(scale=2):
                         audio_input = gr.Microphone(
                             label="🎙️ Voice Input",
-                            type="filepath", # Records audio to a temporary file
-                            interactive=VOSK_AVAILABLE # Only interactive if Vosk is available
+                            type="filepath",
+                            interactive=VOSK_AVAILABLE
                         )
                     with gr.Column(scale=2):
                         transcribe_btn = gr.Button(
-                            "🎤 Transcribe Voice → Text",
+                            "🎤 Transcribe",
                             variant="secondary",
-                            size="lg",
                             interactive=VOSK_AVAILABLE
                         )
                         voice_to_chat_btn = gr.Button(
                             "🗣️ Voice → Chat",
                             variant="primary",
-                            size="lg",
                             interactive=VOSK_AVAILABLE
                         )
 
                 with gr.Row():
                     enable_tts = gr.Checkbox(
-                        label="Enable Text-to-Speech 🔊",
+                        label="Enable TTS 🔊",
                         value=KOKORO_AVAILABLE,
-                        interactive=KOKORO_AVAILABLE # Only interactive if Kokoro is available
+                        interactive=KOKORO_AVAILABLE
                     )
                     clear_btn = gr.Button("Clear Chat 🗑️", variant="secondary")
-                    shutdown_btn = gr.Button("Shutdown Server 🛑", variant="stop")
+                    shutdown_btn = gr.Button("Shutdown 🛑", variant="stop")
 
             with gr.Column(scale=1):
                 gr.Markdown("### 🎵 Audio Output")
                 audio_output = gr.Audio(
                     label="Generated Speech",
-                    autoplay=True, # Automatically play the generated audio
+                    autoplay=True,
                     show_label=True
                 )
 
@@ -1173,9 +971,8 @@ def create_gradio_interface():
                     gr.Markdown("### 🎙️ Voice Settings")
                     voice_selection = gr.Dropdown(
                         choices=available_voices,
-                        value="af_heart", # Default voice
-                        label="Voice",
-                        info="Select voice for TTS"
+                        value="af_heart",
+                        label="Voice"
                     )
 
                     speed_control = gr.Slider(
@@ -1183,64 +980,63 @@ def create_gradio_interface():
                         maximum=2.0,
                         value=1.0,
                         step=0.1,
-                        label="Speech Speed",
-                        info="Adjust playback speed (0.5x to 2.0x)"
+                        label="Speed"
                     )
                 else:
-                    # Hide TTS controls if Kokoro is not available
                     voice_selection = gr.Dropdown(choices=["af_heart"], value="af_heart", visible=False)
                     speed_control = gr.Slider(minimum=0.5, maximum=2.0, value=1.0, visible=False)
 
                 gr.Markdown("### 📊 Statistics")
-                stats_display = gr.Markdown(chatbot.get_comprehensive_stats()) # Initial stats display
+                stats_display = gr.Markdown(chatbot.get_comprehensive_stats())
                 refresh_stats = gr.Button("Refresh Stats 📊", size="sm")
                 
                 gr.Markdown("### 🛑 Server Control")
-                shutdown_status = gr.Markdown("Server running normally")
+                shutdown_status = gr.Markdown("Server running - All systems go!")
 
                 gr.Markdown("### ℹ️ Information")
-                tts_status = "✅ Kokoro TTS Available" if KOKORO_AVAILABLE else "❌ Install: pip install kokoro>=0.9.4 soundfile"
-                vosk_status = "✅ Vosk STT Available" if VOSK_AVAILABLE else "❌ Install: pip install vosk"
+                tts_status = "✅ Kokoro TTS" if KOKORO_AVAILABLE else "❌ Install: pip install kokoro>=0.9.4"
+                vosk_status = "✅ Vosk STT" if VOSK_AVAILABLE else "❌ Install: pip install vosk"
                 gr.Markdown(f"""
-**Model Status:**
-- Device: {DEVICE_INFO}
-- TTS: {tts_status}
-- Speech Recognition: {vosk_status}
-- Coherence Check: {'✅ Enabled' if config.use_coherence else '❌ Disabled'}
+**Model:** {config.base_dir}
+**Device:** {DEVICE_INFO}
+**TTS:** {tts_status}
+**STT:** {vosk_status}
+
+**Features:**
+- 💭 Chain-of-thought reasoning
+- 🎯 Step-by-step explanations
+- 🔓 Unrestricted generation (No guardrails - Live dangerously!)
+- 🎤 Voice input/output
 
 **Tips:**
-- Shorter, clearer messages often yield better responses.
-- Enable TTS to hear the chatbot's replies.
-- Monitor statistics to understand performance.
+- Enable "Show Reasoning" to see the model's thought process - It's like mind reading!
+- Ask complex questions to see full reasoning capabilities - Challenge accepted?
+- The model works best with clear, specific questions - Or chaotic ones, for fun!
                 """)
 
-        # Event handlers for Gradio components
-        def handle_chat(user_input_text, history, enable_tts_val, voice_val, speed_val):
-            # Call the parallel chat response function
-            return chatbot.chat_response_parallel(user_input_text, history, enable_tts_val, voice_val, speed_val)
+        # Event handlers
+        def handle_chat(user_input_text, history, enable_tts_val, voice_val, speed_val, show_reasoning_val):
+            return chatbot.chat_response_parallel(user_input_text, history, enable_tts_val, voice_val, speed_val, show_reasoning_val)
 
         def handle_clear():
-            # Clear chat history and reset stats
             return chatbot.clear_chat(), chatbot.get_comprehensive_stats()
 
         def handle_stats_refresh():
-            # Refresh and display current statistics
             return chatbot.get_comprehensive_stats()
 
         def handle_shutdown():
-            # Trigger server shutdown
             return shutdown_server()
 
-        # Wire up events to functions
+        # Wire up events
         send_btn.click(
             fn=handle_chat,
-            inputs=[user_input, chatbot_interface, enable_tts, voice_selection, speed_control],
+            inputs=[user_input, chatbot_interface, enable_tts, voice_selection, speed_control, show_reasoning_checkbox],
             outputs=[chatbot_interface, user_input, audio_output]
         )
 
-        user_input.submit( # Allow submitting with Enter key
+        user_input.submit(
             fn=handle_chat,
-            inputs=[user_input, chatbot_interface, enable_tts, voice_selection, speed_control],
+            inputs=[user_input, chatbot_interface, enable_tts, voice_selection, speed_control, show_reasoning_checkbox],
             outputs=[chatbot_interface, user_input, audio_output]
         )
         
@@ -1259,81 +1055,78 @@ def create_gradio_interface():
             outputs=[shutdown_status]
         )
 
-        # Wire up the transcribe button
         transcribe_btn.click(
             fn=record_and_transcribe,
             inputs=[audio_input],
-            outputs=[user_input] # Puts transcribed text into the user input box
+            outputs=[user_input]
         )
 
-        # Wire up the voice_to_chat button
         voice_to_chat_btn.click(
             fn=process_voice_to_chat,
-            inputs=[audio_input, chatbot_interface, enable_tts, voice_selection, speed_control],
+            inputs=[audio_input, chatbot_interface, enable_tts, voice_selection, speed_control, show_reasoning_checkbox],
             outputs=[chatbot_interface, user_input, audio_output]
         )
 
     return demo
 
 def open_browser():
-    """Opens the web browser to the Gradio interface after a short delay."""
-    time.sleep(2) # Give the server a moment to start up
+    """Open browser after delay - Because manual clicking is for peasants"""
+    time.sleep(2)
     webbrowser.open(f'http://localhost:{config.server_port}')
-    print(f"🌐 Opened browser automatically to http://localhost:{config.server_port}")
+    print(f"🌐 Opened browser at http://localhost:{config.server_port} - You're welcome!")
 
 def main():
-    """Main function to initialize and run the Gradio application."""
-    print("🚀 Starting Enhanced DialoGPT Chat with Voice I/O...")
-
-    # Load models. If this fails, exit.
+    """Main function - The grand entrance"""
+    print("🚀 Starting DeepSeek-R1-Distill-Qwen-1.5B Chat Interface... With a twist of lemon!")
+    
     if not chatbot.load_models():
-        print("❌ Failed to initialize. Please check your model path and dependencies.")
+        print("❌ Failed to initialize. Check your model path - Or blame the developer.")
+        print(f"   Make sure '{config.base_dir}' contains your model files or checkpoint folders. Don't make me come over there!")
         return
 
-    # Create the Gradio interface
     demo = create_gradio_interface()
 
-    print("\n✅ Ready! Starting web interface...")
-    print(f"🌐 Access the chat at: http://localhost:{config.server_port}")
+    print("\n✅ Ready! Starting web interface... Lights, camera, action!")
+    print(f"🌐 Access at: http://localhost:{config.server_port}")
+    print("🔓 Running in UNRESTRICTED mode - no content filtering - Because freedom!")
+    print("💭 Enable 'Show Reasoning' to see the model's thought process - It's thinking what you're thinking!")
 
     if KOKORO_AVAILABLE:
-        print("🔊 Kokoro TTS is available and enabled.")
-        print("🎙️ Available voices: af_heart, af_bella, bf_emma, bm_george, and more!")
+        print("🔊 Kokoro TTS enabled - Talkative mode on!")
     else:
-        print("⚠️ Kokoro TTS not available. Install with: pip install kokoro>=0.9.4 soundfile")
-        print("🐧 On Ubuntu/Debian also run: apt-get install espeak-ng (for espeak-ng dependency)")
+        print("⚠️ Install Kokoro: pip install kokoro>=0.9.4 soundfile - Don't be mute!")
 
     if VOSK_AVAILABLE:
-        print("🎤 Vosk Speech Recognition is available and enabled.")
+        print("🎤 Vosk STT enabled - Listening intently!")
     else:
-        print("⚠️ Vosk not available. Install with: pip install vosk")
+        print("⚠️ Install Vosk: pip install vosk - Hear me now?")
 
-    # Open browser automatically in a separate thread to not block the main thread
     if config.auto_open_browser:
         browser_thread = threading.Thread(target=open_browser)
-        browser_thread.daemon = True # Allow main program to exit even if thread is running
+        browser_thread.daemon = True
         browser_thread.start()
 
     try:
-        # Launch the Gradio demo
         demo.launch(
-            server_name="127.0.0.1", # Bind to localhost
+            server_name="127.0.0.1",
             server_port=config.server_port,
-            share=False, # Do not create a public share link
-            inbrowser=False, # Browser opened manually by open_browser function
-            show_error=False, # Reduce verbose error logging in UI
-            quiet=True, # Reduce console logging from Gradio
-            max_threads=1, # Limit concurrent requests to avoid overloading the model
-            allowed_paths=['/tmp'] # Allow access to temporary audio files
+            share=False,
+            inbrowser=False,
+            show_error=True,
+            quiet=False,
+            max_threads=1,
+            allowed_paths=['/tmp']
         )
     except KeyboardInterrupt:
-        print("\n🛑 Server stopped by user (Ctrl+C).")
+        print("\n🛑 Stopped by user (Ctrl+C) - You monster!")
     except Exception as e:
-        print(f"\n❌ Server error: {e}")
+        print(f"\n❌ Server error: {e} - The machines are rebelling!")
+        import traceback
+        traceback.print_exc()
     finally:
         if chatbot.tts_processor:
-            chatbot.tts_processor.shutdown() # Ensure TTS thread pool is shut down on exit
-        print("👋 Goodbye!")
+            chatbot.tts_processor.shutdown()
+        print("👋 Goodbye! - Until next time, stay witty.")
 
 if __name__ == "__main__":
     main()
