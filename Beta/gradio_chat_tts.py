@@ -48,7 +48,7 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 # Configuration
 @dataclass
 class Config:
-    base_dir: str = "./dialogpt-finetuned/"  # Path to the parent directory of your checkpoints
+    base_dir: str = "./dialogpt-finetuned/"  # Path to the parent directory of your checkpoints (legacy name, but for DeepSeek 1.5B)
     vosk_model_path: str = "vosk-model-en-us-0.42-gigaspeech"
     server_port: int = 7860
     auto_open_browser: bool = True
@@ -58,7 +58,7 @@ class Config:
     memory_cleanup_threshold: float = 0.8
     # DeepSeek-R1 specific settings
     show_reasoning: bool = False  # Whether to show <think> blocks
-    use_system_prompt: bool = True
+    use_system_prompt: bool = False  # Set to False for Qwen compatibility; avoids unnecessary complexity for small model
 
 config = Config()
 
@@ -399,34 +399,34 @@ class DeepSeekChatBot:
         self.generation_configs = self._create_generation_configs()
     
     def _create_generation_configs(self) -> List[Dict]:
-        """Generation configs optimized for reasoning models - Mix it up!"""
+        """Generation configs optimized for reasoning models - Mix it up! Increased temperature and tokens for small model to encourage output."""
         return [
             {
                 'name': 'balanced',
-                'max_new_tokens': 512,
+                'max_new_tokens': 768,  # Bump up for more room on complex prompts
                 'do_sample': True,
-                'temperature': 0.7,
-                'top_p': 0.9,
+                'temperature': 0.8,  # Slightly higher to avoid blanks
+                'top_p': 0.95,
                 'top_k': 50,
-                'repetition_penalty': 1.05,
+                'repetition_penalty': 1.1,  # Adjust to reduce loops
             },
             {
                 'name': 'creative',
-                'max_new_tokens': 768,
+                'max_new_tokens': 1024,
                 'do_sample': True,
-                'temperature': 0.85,
+                'temperature': 0.95,
                 'top_p': 0.95,
                 'top_k': 60,
-                'repetition_penalty': 1.03,
+                'repetition_penalty': 1.05,
             },
             {
                 'name': 'focused',
-                'max_new_tokens': 384,
+                'max_new_tokens': 512,
                 'do_sample': True,
-                'temperature': 0.6,
+                'temperature': 0.7,
                 'top_p': 0.85,
                 'top_k': 40,
-                'repetition_penalty': 1.08,
+                'repetition_penalty': 1.15,
             }
         ]
     
@@ -571,17 +571,13 @@ class DeepSeekChatBot:
 
     def _format_prompt_for_deepseek(self, user_input: str, system_prompt: Optional[str] = None) -> str:
         """
-        Format prompt for DeepSeek-R1 models
-        These models use: <｜User｜>{input}<｜Assistant｜> format
-        If it's not DeepSeek, well... adapt or die!
+        Updated format for Qwen compatibility: Use <|im_start|> tags to avoid token mismatches and blank outputs.
+        This should help the small model generate something, even if imperfect.
         """
+        formatted = ""
         if system_prompt and config.use_system_prompt:
-            # Include system prompt if provided
-            formatted = f"<｜System｜>{system_prompt}\n<｜User｜>{user_input}<｜Assistant｜>"
-        else:
-            # Simple user-assistant format
-            formatted = f"<｜User｜>{user_input}<｜Assistant｜>"
-        
+            formatted += f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        formatted += f"<|im_start|>user\n{user_input}<|im_end|>\n<|im_start|>assistant\n"
         return formatted
     
     def _extract_response_from_output(self, full_output: str, show_reasoning: bool = False) -> str:
@@ -590,8 +586,8 @@ class DeepSeekChatBot:
         DeepSeek-R1 models can produce <think>reasoning</think> blocks - Fancy thinkers!
         """
         # Remove the input prompt if it's in the output
-        if "<｜Assistant｜>" in full_output:
-            full_output = full_output.split("<｜Assistant｜>", 1)[-1]
+        if "<|im_start|>assistant" in full_output:
+            full_output = full_output.split("<|im_start|>assistant", 1)[-1]
         
         # Handle thinking blocks
         if "<think>" in full_output and "</think>" in full_output:
@@ -663,9 +659,13 @@ class DeepSeekChatBot:
             
             # Decode only generated tokens
             generated_ids = outputs[0][input_length:]
+            if len(generated_ids) == 0:
+                print("⚠️ No tokens generated - Falling back.")
+                return self._get_fallback_response(user_input)
+            
             raw_response = self.tokenizer.decode(
                 generated_ids,
-                skip_special_tokens=False,  # Keep special tokens for parsing
+                skip_special_tokens=True,  # Switch to True for cleaner output, as <think> might not always trigger
                 clean_up_tokenization_spaces=True
             )
             
