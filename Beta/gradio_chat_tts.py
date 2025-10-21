@@ -48,24 +48,19 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 # Configuration
 @dataclass
 class Config:
-    base_dir: str = "./dialogpt-finetuned/"  # Path to the parent directory of your checkpoints (legacy name, but for DeepSeek 1.5B)
+    base_dir: str = "./dialogpt-finetuned/"  # Path to the parent directory of your checkpoints (legacy name, but for Rhizome 1.5B)
     vosk_model_path: str = "vosk-model-en-us-0.42-gigaspeech"
     server_port: int = 7860
     auto_open_browser: bool = True
     max_cache_size: int = 100
     max_response_length: int = 512
     tts_max_length: int = 500
-    memory_cleanup_threshold: float = 0.8
-    # DeepSeek-R1 specific settings
+    memory_cleanup_threshold: float = 0.6  # Lower threshold for CPU safety
+    # Rhizome specific settings
     show_reasoning: bool = False  # Whether to show <think> blocks
     use_system_prompt: bool = False  # Set to False for Qwen compatibility; avoids unnecessary complexity for small model
 
 config = Config()
-
-# Global variables
-DEVICE = torch.device("cpu")
-DEVICE_INFO = "CPU (default)"
-DEVICE_DETAILS = {}
 
 class PerformanceMonitor:
     """Monitor system performance"""
@@ -261,7 +256,14 @@ class AsyncTTSProcessor:
                 audio_segment = audio_segment.cpu()
             
             filename = f"/tmp/tts_{uuid.uuid4().hex[:8]}.wav"
-            sf.write(filename, audio_segment, 24000)
+            
+            # Add error handling for WAV writing
+            try:
+                sf.write(filename, audio_segment, 24000)
+            except Exception as write_error:
+                print(f"⚠️ WAV write failed: {write_error}")
+                return None
+                
             return filename
             
         except Exception as e:
@@ -375,9 +377,9 @@ class EnhancedVoiceTranscriber:
         except Exception as e:
             return f"❌ Processing failed: {str(e)}"
 
-class DeepSeekChatBot:
+class RhizomeChatBot:
     """
-    Optimized chatbot for DeepSeek-R1-Distill-Qwen-1.5B reasoning model
+    Optimized chatbot for Rhizome reasoning model
     Or whatever model you're throwing at it - we're flexible like that!
     """
     
@@ -412,12 +414,12 @@ class DeepSeekChatBot:
             },
             {
                 'name': 'creative',
-                'max_new_tokens': 1024,
+                'max_new_tokens': 800,  # Reduced from 1024 to prevent over-verbosity
                 'do_sample': True,
                 'temperature': 0.95,
                 'top_p': 0.95,
                 'top_k': 60,
-                'repetition_penalty': 1.05,
+                'repetition_penalty': 1.1,  # Reduced from 1.05
             },
             {
                 'name': 'focused',
@@ -431,7 +433,7 @@ class DeepSeekChatBot:
         ]
     
     def load_models(self) -> bool:
-        """Load DeepSeek model and accessories - Fingers crossed, no explosions!"""
+        """Load Rhizome model and accessories - Fingers crossed, no explosions!"""
         try:
             print(f"📄 Loading from {config.base_dir}...")
             checkpoint_path = self._find_latest_checkpoint(config.base_dir)
@@ -569,7 +571,7 @@ class DeepSeekChatBot:
         
         print("✅ Model pre-warmed - Hot and ready!")
 
-    def _format_prompt_for_deepseek(self, user_input: str, system_prompt: Optional[str] = None) -> str:
+    def _format_prompt_for_Rhizome(self, user_input: str, system_prompt: Optional[str] = None) -> str:
         """
         Updated format for Qwen compatibility: Use <|im_start|> tags to avoid token mismatches and blank outputs.
         This should help the small model generate something, even if imperfect.
@@ -582,8 +584,8 @@ class DeepSeekChatBot:
     
     def _extract_response_from_output(self, full_output: str, show_reasoning: bool = False) -> str:
         """
-        Extract final response from DeepSeek output
-        DeepSeek-R1 models can produce <think>reasoning</think> blocks - Fancy thinkers!
+        Extract final response from Rhizome output
+        Rhizome models can produce <think>reasoning</think> blocks - Fancy thinkers!
         """
         # Remove the input prompt if it's in the output
         if "<|im_start|>assistant" in full_output:
@@ -604,12 +606,13 @@ class DeepSeekChatBot:
         else:
             response = full_output
         
-        # Clean up response
+        # Clean up response - single regex for all special tokens
         response = response.strip()
+        response = re.sub(r'<\|im.*?\|>', '', response)  # Handles both im_start and im_end
         
-        # Remove any remaining special tokens
-        response = re.sub(r'<｜.*?｜>', '', response)
-        response = re.sub(r'<\|.*?\|>', '', response)
+        # Remove any User:/Assistant: prefixes that might leak through
+        response = re.sub(r'^(User|Assistant):\s*', '', response, flags=re.IGNORECASE)
+        response = re.sub(r'\n(User|Assistant):\s*.*$', '', response, flags=re.IGNORECASE | re.MULTILINE)
         
         # Clean whitespace
         response = re.sub(r'\n{3,}', '\n\n', response)
@@ -618,7 +621,7 @@ class DeepSeekChatBot:
         return response.strip()
     
     def generate_response_optimized(self, user_input: str, show_reasoning: bool = False) -> Tuple[str, str]:
-        """Generate response with DeepSeek model - Optimized for wit and wisdom"""
+        """Generate response with Rhizome model - Optimized for wit and wisdom"""
         start_time = time.perf_counter()
         
         # Check cache
@@ -635,9 +638,9 @@ class DeepSeekChatBot:
         
         method = f"optimized_{gen_config['name']}"
         try:
-            # Format prompt for DeepSeek
-            system_prompt = None  # Can be customized
-            formatted_input = self._format_prompt_for_deepseek(user_input, system_prompt)
+            # Format prompt for Rhizome
+            system_prompt = f"You are Rhizome, a versatile model operating primarily as a Polymath Agent-Based Model that is precise yet daring, clear yet witty, whimsical and charismatic, with a dash of satirical edge and playfulness."  # Can be customized
+            formatted_input = self._format_prompt_for_Rhizome(user_input, system_prompt)
             
             with torch_inference_mode():
                 inputs = self.tokenizer(
@@ -840,10 +843,10 @@ class DeepSeekChatBot:
         print("🗑️ Chat cleared - What chat? I don't remember any chat.")
         return []
 
-# Global initialization
+# Global initialization - NOW ACTUALLY INITIALIZING!
 DEVICE, DEVICE_INFO, DEVICE_DETAILS = get_optimal_device_config()
 optimize_torch_settings(DEVICE, DEVICE_DETAILS.get('cpu_cores', multiprocessing.cpu_count()))
-chatbot = DeepSeekChatBot()
+chatbot = RhizomeChatBot()
 
 def record_and_transcribe(audio_file_path):
     """Transcribe audio file - Decoding the sounds of mystery"""
@@ -903,8 +906,8 @@ def create_gradio_interface():
     }
     """
 
-    with gr.Blocks(css=css, title="DeepSeek-R1 Chat - Now with Extra Sass!") as demo:
-        gr.Markdown("# 🧠 DeepSeek-R1-Distill-Qwen-1.5B Chat Interface")
+    with gr.Blocks(css=css, title="Rhizome Chat - Now with Extra Sass!") as demo:
+        gr.Markdown("# 🧠 Rhizome Chat Interface")
         gr.Markdown("Reasoning model optimized for thoughtful, step-by-step responses with voice I/O support. Now 20% more whimsical!")
 
         with gr.Row():
@@ -1077,7 +1080,7 @@ def open_browser():
 
 def main():
     """Main function - The grand entrance"""
-    print("🚀 Starting DeepSeek-R1-Distill-Qwen-1.5B Chat Interface... With a twist of lemon!")
+    print("🚀 Starting Rhizome Chat Interface... With a twist of lemon!")
     
     if not chatbot.load_models():
         print("❌ Failed to initialize. Check your model path - Or blame the developer.")
