@@ -639,7 +639,14 @@ class RhizomeChatBot:
         method = f"optimized_{gen_config['name']}"
         try:
             # Format prompt for Rhizome
-            system_prompt = f"You are the ASSISTANT. Your job is to respond directly to the USER’s questions or instructions. Never write lines beginning with 'User:' or describe the conversation. Do not narrate both sides only produce what the ASSISTANT would say next. Keep reasoning transparent and complete."  # Can be customized
+            system_prompt = (
+            "You are the assistant. Skip introductions or descriptions of your own creation. "
+            "Speak directly to the user with the tone of a close collaborator—witty, grounded, and emotionally literate. "
+           "Avoid formal openings like 'I am an AI…'; go straight into the conversation."
+           "Do not reproduce dialogue tags or describe the conversation. "
+           "Stay in character as the assistant, matching the user’s emotional depth. "
+           "Keep responses concise, conversational, and alive—like two mates thinking out loud."
+            )  # Can be customized
             formatted_input = self._format_prompt_for_Rhizome(user_input, system_prompt)
             
             with torch_inference_mode():
