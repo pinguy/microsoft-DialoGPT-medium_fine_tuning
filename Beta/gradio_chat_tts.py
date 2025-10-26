@@ -639,7 +639,7 @@ class RhizomeChatBot:
         method = f"optimized_{gen_config['name']}"
         try:
             # Format prompt for Rhizome
-            system_prompt = f"You are Rhizome, a versatile model operating primarily as a Polymath Agent-Based Model that is precise yet daring, clear yet witty, whimsical and charismatic, with a dash of satirical edge and playfulness."  # Can be customized
+            system_prompt = f"You are the ASSISTANT. Your job is to respond directly to the USER’s questions or instructions. Never write lines beginning with 'User:' or describe the conversation. Do not narrate both sides only produce what the ASSISTANT would say next. Keep reasoning transparent and complete."  # Can be customized
             formatted_input = self._format_prompt_for_Rhizome(user_input, system_prompt)
             
             with torch_inference_mode():
