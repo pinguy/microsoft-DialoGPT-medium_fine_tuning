@@ -1306,7 +1306,7 @@ class VectorMemory:
                 "embeddings": {mid: emb.tolist() for mid, emb in self.embeddings.items()},
                 "mementos": self.mementos,
                 "scores": scores_data,
-                "id_to_label": {k: int(v) for k, v in self._id_to_label.items()},
+                "id_to_label": {str(k): v for k, v in self._id_to_label.items()},
                 "next_label": self._next_label
             }
             
