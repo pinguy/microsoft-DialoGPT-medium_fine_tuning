@@ -1,3 +1,9 @@
+"""
+Enhanced Rhizome Chat with UCS v3.4.1 Integration
+Combines the Rhizome reasoning model with UCS cognitive architecture
+for memory-augmented, expert-guided conversations.
+"""
+
 import torch
 import re
 import os
@@ -10,15 +16,28 @@ import wave
 import json
 import subprocess
 import threading
-import time # Added for performance profiling
+import time
 import webbrowser
-import uuid # Added for unique temporary filenames in TTS
-import gc # Added for memory optimization
-import asyncio # Added for parallel processing concept
-import concurrent.futures # Added for parallel processing concept
+import uuid
+import gc
+import concurrent.futures
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from sentence_transformers import SentenceTransformer
 import logging
+import multiprocessing
+from dataclasses import dataclass
+from typing import Optional, Tuple, List, Dict, Any
+from contextlib import contextmanager
+import psutil
+from pathlib import Path
+
+# Import UCS
+from UCS_v3_4_1 import (
+    UnifiedCognitionSystem,
+    VectorMemory,
+    HAS_NUMPY,
+    HAS_SENTENCE_TRANSFORMERS,
+    _logger as ucs_logger
+)
 
 # Try to import optional dependencies
 try:
@@ -39,1022 +58,1235 @@ except ImportError:
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
-logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
 
 # Configuration
-BASE_DIR = "./dialogpt-finetuned/"
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-COHERENCE_THRESHOLD = 0.4
-USE_COHERENCE = True
-VOSK_MODEL_PATH = "vosk-model-en-us-0.42-gigaspeech"
-SERVER_PORT = 7860
-AUTO_OPEN_BROWSER = True
+@dataclass
+class Config:
+    base_dir: str = "./dialogpt-finetuned/"
+    vosk_model_path: str = "vosk-model-en-us-0.42-gigaspeech"
+    server_port: int = 7860
+    auto_open_browser: bool = True
+    max_cache_size: int = 100
+    max_response_length: int = 512
+    tts_max_length: int = 500
+    memory_cleanup_threshold: float = 0.6
+    show_reasoning: bool = False
+    use_system_prompt: bool = False
+    # UCS Integration
+    use_ucs: bool = True
+    ucs_memory_enabled: bool = True
+    ucs_expert_system: bool = True
+    ucs_embed_model: str = "all-MiniLM-L12-v2"  # Sentence transformer model
+    ucs_save_path: str = "rhizome_memory.json"  # Use JSON format for compatibility
+    ucs_auto_save_interval: int = 300  # Save every 5 minutes
+    ucs_fast_retrieval: bool = True  # Use fast direct retrieval instead of full cognitive loop
 
+config = Config()
 
-class VoiceTranscriber:
-    """Handle voice transcription using Vosk"""
+# [Previous helper classes remain the same: PerformanceMonitor, EnhancedCache, etc.]
+class PerformanceMonitor:
+    """Monitor system performance"""
+    
+    def __init__(self):
+        self.response_times = []
+        self.start_time = time.time()
+        
+    def log_response_time(self, duration: float, method: str):
+        self.response_times.append((time.time(), duration, method))
+        if len(self.response_times) > 100:
+            self.response_times = self.response_times[-100:]
+    
+    def get_system_stats(self) -> Dict[str, Any]:
+        stats = {
+            'cpu_percent': psutil.cpu_percent(),
+            'memory_percent': psutil.virtual_memory().percent,
+            'uptime': time.time() - self.start_time
+        }
+        
+        if torch.cuda.is_available():
+            try:
+                stats['gpu_memory_used'] = torch.cuda.memory_allocated() / 1024**3
+                stats['gpu_memory_total'] = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            except:
+                pass
+                
+        return stats
+    
+    def should_cleanup_memory(self) -> bool:
+        return psutil.virtual_memory().percent > config.memory_cleanup_threshold * 100
 
-    def __init__(self, model_path=VOSK_MODEL_PATH):
+class EnhancedCache:
+    """Intelligent caching system"""
+    
+    def __init__(self, max_size: int = 100):
+        self.cache = {}
+        self.access_times = {}
+        self.hit_count = 0
+        self.miss_count = 0
+        self.max_size = max_size
+        
+    def _normalize_key(self, key: str) -> str:
+        return re.sub(r'\s+', ' ', key.lower().strip())
+    
+    def get(self, key: str) -> Optional[str]:
+        normalized_key = self._normalize_key(key)
+        if normalized_key in self.cache:
+            self.access_times[normalized_key] = time.time()
+            self.hit_count += 1
+            return self.cache[normalized_key]
+        
+        self.miss_count += 1
+        return None
+    
+    def put(self, key: str, value: str):
+        normalized_key = self._normalize_key(key)
+        
+        if len(self.cache) >= self.max_size and normalized_key not in self.cache:
+            oldest_key = min(self.access_times.keys(), 
+                           key=lambda k: self.access_times.get(k, 0))
+            del self.cache[oldest_key]
+            del self.access_times[oldest_key]
+        
+        self.cache[normalized_key] = value
+        self.access_times[normalized_key] = time.time()
+    
+    def get_stats(self) -> Dict[str, Any]:
+        total_requests = self.hit_count + self.miss_count
+        hit_rate = (self.hit_count / total_requests * 100) if total_requests > 0 else 0
+        
+        return {
+            'size': len(self.cache),
+            'max_size': self.max_size,
+            'hit_rate': f"{hit_rate:.2f}%",
+            'hits': self.hit_count,
+            'misses': self.miss_count
+        }
+    
+    def clear(self):
+        self.cache.clear()
+        self.access_times.clear()
+        self.hit_count = 0
+        self.miss_count = 0
+
+@contextmanager
+def torch_inference_mode():
+    """Context manager for optimized PyTorch inference"""
+    with torch.inference_mode():
+        if DEVICE.type == 'cuda':
+            with torch.cuda.amp.autocast():
+                yield
+        else:
+            yield
+
+def get_optimal_device_config() -> Tuple[torch.device, str, Dict]:
+    """Detects optimal device"""
+    device = torch.device("cpu")
+    device_info = "CPU (default)"
+    details = {'cpu_cores': multiprocessing.cpu_count()}
+    
+    if torch.backends.mps.is_available():
+        try:
+            device = torch.device("mps")
+            device_info = "MPS (Apple Silicon)"
+            details['decision'] = "MPS selected"
+            test_tensor = torch.randn(100, 100, device='mps')
+            _ = test_tensor @ test_tensor.T
+            del test_tensor
+        except Exception as e:
+            logger.warning(f"MPS test failed: {e}, falling back to CPU")
+            details['mps_error'] = str(e)
+    
+    elif torch.cuda.is_available():
+        try:
+            gpu_name = torch.cuda.get_device_name(0)
+            props = torch.cuda.get_device_properties(0)
+            compute_capability = f"{props.major}.{props.minor}"
+            memory_gb = props.total_memory / (1024**3)
+            
+            details.update({
+                'gpu_name': gpu_name,
+                'compute_capability': compute_capability,
+                'memory_gb': memory_gb,
+                'multiprocessor_count': props.multi_processor_count
+            })
+            
+            try:
+                test_tensor = torch.randn(100, 100, device='cuda')
+                _ = test_tensor @ test_tensor.T
+                del test_tensor
+                torch.cuda.empty_cache()
+                
+                if props.major >= 7 or (props.major >= 6 and memory_gb >= 4):
+                    device = torch.device("cuda")
+                    device_info = f"GPU: {gpu_name} ({compute_capability}, {memory_gb:.1f}GB)"
+                    details['decision'] = "GPU selected"
+                else:
+                    device_info = f"CPU: {details['cpu_cores']} cores"
+                    details['decision'] = "CPU selected - GPU insufficient"
+                    
+            except Exception as e:
+                device_info = f"CPU: {details['cpu_cores']} cores"
+                details['decision'] = f"CPU selected - CUDA error"
+                
+        except Exception as e:
+            details['gpu_error'] = str(e)
+            device_info = f"CPU: {details['cpu_cores']} cores"
+            details['decision'] = "CPU selected"
+            
+    return device, device_info, details
+
+def optimize_torch_settings(device: torch.device, cpu_cores: int):
+    """Optimize PyTorch settings"""
+    if device.type == "cuda":
+        logger.info("🔧 Configuring GPU optimizations...")
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.enabled = True
+    elif device.type == "mps":
+        logger.info("🔧 Configuring MPS optimizations...")
+    else:
+        logger.info("🔧 Configuring CPU optimizations...")
+        optimal_threads = max(1, min(cpu_cores - 1, 8))
+        torch.set_num_threads(optimal_threads)
+        torch.set_num_interop_threads(optimal_threads)
+        
+        if hasattr(torch.backends, 'mkldnn'):
+            torch.backends.mkldnn.enabled = True
+
+class AsyncTTSProcessor:
+    """Async TTS processing"""
+    
+    def __init__(self, tts_pipeline):
+        self.tts_pipeline = tts_pipeline
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2) 
+        
+    def generate_async(self, text: str, voice: str = 'af_heart', speed: float = 1.0) -> concurrent.futures.Future:
+        return self.executor.submit(self._generate_tts, text, voice, speed)
+    
+    def _generate_tts(self, text: str, voice: str, speed: float) -> Optional[str]:
+        if not self.tts_pipeline or len(text) > config.tts_max_length:
+            return None
+            
+        try:
+            # Clean and prepare text for TTS
+            clean_text = re.sub(r'[^\w\s.,!?;:\'-]', '', text).strip()
+            if not clean_text:
+                return None
+            
+            # Replace line breaks with periods to prevent stopping
+            clean_text = re.sub(r'\n+', '. ', clean_text)
+            # Remove multiple spaces
+            clean_text = re.sub(r'\s+', ' ', clean_text)
+            # Ensure proper sentence endings
+            clean_text = re.sub(r'([.!?])\s*([A-Z])', r'\1 \2', clean_text)
+            
+            # Split into chunks if too long (helps with generation)
+            max_chunk_size = 200  # characters per chunk
+            if len(clean_text) > max_chunk_size:
+                # Split on sentence boundaries
+                sentences = re.split(r'([.!?]+\s+)', clean_text)
+                chunks = []
+                current_chunk = ""
+                
+                for i in range(0, len(sentences), 2):
+                    sentence = sentences[i]
+                    delimiter = sentences[i+1] if i+1 < len(sentences) else ""
+                    
+                    if len(current_chunk) + len(sentence) + len(delimiter) > max_chunk_size and current_chunk:
+                        chunks.append(current_chunk.strip())
+                        current_chunk = sentence + delimiter
+                    else:
+                        current_chunk += sentence + delimiter
+                
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                
+                # Generate audio for each chunk and concatenate
+                audio_segments = []
+                sample_rate = 24000
+                
+                for chunk in chunks:
+                    if not chunk.strip():
+                        continue
+                    
+                    audio_gen = self.tts_pipeline(chunk, voice=voice, speed=speed)
+                    audio_segment = next(audio_gen)[2]
+                    
+                    if hasattr(audio_segment, 'device') and audio_segment.device.type != 'cpu':
+                        audio_segment = audio_segment.cpu()
+                    
+                    if hasattr(audio_segment, 'numpy'):
+                        audio_segment = audio_segment.numpy()
+                    
+                    audio_segments.append(audio_segment)
+                
+                # Concatenate all segments
+                if audio_segments:
+                    import numpy as np
+                    full_audio = np.concatenate(audio_segments)
+                else:
+                    return None
+            else:
+                # Single chunk - process normally
+                audio_gen = self.tts_pipeline(clean_text, voice=voice, speed=speed)
+                full_audio = next(audio_gen)[2]
+                
+                if hasattr(full_audio, 'device') and full_audio.device.type != 'cpu':
+                    full_audio = full_audio.cpu()
+                
+                if hasattr(full_audio, 'numpy'):
+                    full_audio = full_audio.numpy()
+            
+            filename = f"/tmp/tts_{uuid.uuid4().hex[:8]}.wav"
+            
+            try:
+                sf.write(filename, full_audio, 24000)
+                return filename
+            except Exception as write_error:
+                logger.warning(f"WAV write failed: {write_error}")
+                return None
+                
+        except Exception as e:
+            logger.warning(f"TTS Error: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def shutdown(self):
+        self.executor.shutdown(wait=True)
+
+class EnhancedVoiceTranscriber:
+    """Voice transcription with Vosk"""
+    
+    def __init__(self, model_path: str = config.vosk_model_path):
         self.model_path = model_path
         self.model = None
         self.recognizer = None
         self.load_model()
-
-    def load_model(self):
-        """Load the Vosk model"""
+    
+    def load_model(self) -> bool:
         if not VOSK_AVAILABLE:
-            print("❌ Vosk not available for transcription")
             return False
-
-        if not os.path.exists(self.model_path):
-            print(f"❌ Vosk model not found at: {self.model_path}")
-            print("Please download the model:")
-            print("wget https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip")
-            print("unzip vosk-model-en-us-0.22.zip")
+            
+        if not Path(self.model_path).exists():
+            logger.error(f"Vosk model not found at: {self.model_path}")
             return False
-
+            
         try:
-            print(f"🔄 Loading Vosk model from {self.model_path}...")
+            logger.info(f"📄 Loading Vosk model...")
             self.model = vosk.Model(self.model_path)
             self.recognizer = vosk.KaldiRecognizer(self.model, 16000)
-            print("✅ Vosk model loaded successfully")
+            logger.info("✅ Vosk loaded")
             return True
         except Exception as e:
-            print(f"❌ Failed to load Vosk model: {e}")
+            logger.error(f"Failed to load Vosk: {e}")
             return False
-
-    def preprocess_audio(self, input_path, output_path):
-        """Preprocess audio for better transcription"""
+    
+    def transcribe_audio(self, audio_file_path: str) -> str:
+        if not self.model or not audio_file_path or not Path(audio_file_path).exists():
+            return "❌ Transcription unavailable"
+            
+        temp_dir = tempfile.mkdtemp()
+        processed_wav = Path(temp_dir) / "processed.wav"
+        
         try:
-            # Use ffmpeg to convert and clean audio
+            if not self._preprocess_audio(audio_file_path, str(processed_wav)):
+                processed_wav = Path(audio_file_path)
+            
+            return self._transcribe_wav(str(processed_wav))
+            
+        except Exception as e:
+            return f"❌ Transcription failed: {str(e)}"
+        finally:
+            try:
+                import shutil
+                shutil.rmtree(temp_dir)
+            except:
+                pass
+    
+    def _preprocess_audio(self, input_path: str, output_path: str) -> bool:
+        try:
             cmd = [
                 'ffmpeg', '-i', input_path,
                 '-vn', '-acodec', 'pcm_s16le',
                 '-ar', '16000', '-ac', '1',
-                '-af', 'highpass=f=300,lowpass=f=3000,volume=0.8',
+                '-af', 'highpass=f=200,lowpass=f=3400,volume=1.2',
                 output_path, '-y'
             ]
-
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            return result.returncode == 0
-
-        except subprocess.TimeoutExpired:
-            print("❌ Audio preprocessing timed out")
-            return False
-        except FileNotFoundError:
-            print("❌ ffmpeg not found. Please install: sudo apt install ffmpeg")
-            return self.preprocess_with_sox(input_path, output_path)
-        except Exception as e:
-            print(f"❌ Audio preprocessing failed: {e}")
-            return False
-
-    def preprocess_with_sox(self, input_path, output_path):
-        """Fallback preprocessing with sox"""
-        try:
-            cmd = ['sox', input_path, '-r', '16000', '-c', '1', '-b', '16', output_path]
+            
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             return result.returncode == 0
         except:
-            # Last resort: copy as-is
             try:
                 import shutil
                 shutil.copy2(input_path, output_path)
                 return True
             except:
                 return False
-
-    def transcribe_audio(self, audio_file_path):
-        """Transcribe audio file to text"""
-        if not self.model or not self.recognizer:
-            return "❌ Transcription model not loaded"
-
-        if not audio_file_path or not os.path.exists(audio_file_path):
-            return "❌ Audio file not found"
-
-        temp_dir = tempfile.mkdtemp()
-        processed_wav = os.path.join(temp_dir, "processed.wav")
-
+    
+    def _transcribe_wav(self, wav_path: str) -> str:
         try:
-            print(f"🎵 Processing audio: {audio_file_path}")
-
-            # Preprocess audio
-            if not self.preprocess_audio(audio_file_path, processed_wav):
-                processed_wav = audio_file_path
-
-            # Read and transcribe audio
-            wf = wave.open(processed_wav, "rb")
-
-            if wf.getnchannels() != 1 or wf.getsampwidth() != 2 or wf.getframerate() != 16000:
-                print("⚠️ Audio format may not be optimal for transcription")
-
-            # Reset recognizer
+            wf = wave.open(wav_path, "rb")
             self.recognizer.Reset()
-
-            # Process audio in chunks
+            
             results = []
-            chunk_size = 4000
-
+            chunk_size = 8000
+            
             while True:
                 data = wf.readframes(chunk_size)
                 if len(data) == 0:
                     break
-
+                    
                 if self.recognizer.AcceptWaveform(data):
                     result = json.loads(self.recognizer.Result())
                     text = result.get('text', '').strip()
                     if text:
                         results.append(text)
-
-            # Get final result
+            
             final_result = json.loads(self.recognizer.FinalResult())
             final_text = final_result.get('text', '').strip()
             if final_text:
                 results.append(final_text)
-
+            
             wf.close()
-
-            # Combine results
+            
             full_text = ' '.join(results).strip()
-
             if full_text:
-                print(f"✅ Transcribed: {full_text[:100]}...")
-                return full_text
+                return re.sub(r'\s+', ' ', full_text).strip()
             else:
-                return "❌ No speech detected in audio"
-
+                return "❌ No speech detected"
+                
         except Exception as e:
-            print(f"❌ Transcription error: {e}")
-            return f"❌ Transcription failed: {str(e)}"
+            return f"❌ Processing failed: {str(e)}"
 
-        finally:
-            # Cleanup
-            try:
-                import shutil
-                shutil.rmtree(temp_dir)
-            except:
-                pass
-
-class ResponseCache:
-    """Simple in-memory cache for responses."""
-    def __init__(self, max_size=50):
-        self.cache = {}
-        self.max_size = max_size
-        self.keys_ordered = [] # To maintain order for LRU
-
-    def get_cached_response(self, user_input):
-        """Retrieve a cached response."""
-        input_key = user_input.lower().strip()
-        if input_key in self.cache:
-            # Move to end to mark as recently used
-            self.keys_ordered.remove(input_key)
-            self.keys_ordered.append(input_key)
-            return self.cache[input_key]
-        return None
-
-    def cache_response(self, user_input, response):
-        """Cache a new response."""
-        input_key = user_input.lower().strip()
-        if input_key in self.cache: # Update existing entry
-            self.keys_ordered.remove(input_key)
-        elif len(self.cache) >= self.max_size:
-            # Remove oldest entry (LRU)
-            oldest_key = self.keys_ordered.pop(0)
-            del self.cache[oldest_key]
-        
-        self.cache[input_key] = response
-        self.keys_ordered.append(input_key)
-
-
-class ChatBot:
-    """Main chatbot class with DialoGPT and TTS functionality"""
-
+class UCSEnhancedChatBot:
+    """
+    Rhizome ChatBot enhanced with UCS v3.4.1
+    Combines reasoning model with cognitive architecture
+    """
+    
     def __init__(self):
         self.tokenizer = None
         self.model = None
-        self.coherence_model = None
-        self.tts_pipeline = None
+        self.tts_processor = None
         self.voice_transcriber = None
-        self.gen_configs = None
-        self.conversation_count = 0
-        self.fallback_count = 0
-        self.method_counts = {}
-        self.response_cache = ResponseCache() # Initialize the response cache
-
-    def find_latest_checkpoint(self, base_dir):
-        """Find the latest checkpoint in the directory"""
-        if not os.path.exists(base_dir):
-            raise FileNotFoundError(f"Directory not found: {base_dir}")
-
-        checkpoint_dirs = []
-        for item in os.listdir(base_dir):
-            if item.startswith("checkpoint-") and os.path.isdir(os.path.join(base_dir, item)):
-                try:
-                    checkpoint_num = int(item.split("-")[1])
-                    checkpoint_dirs.append((checkpoint_num, os.path.join(base_dir, item)))
-                except (IndexError, ValueError):
-                    continue
-
-        if not checkpoint_dirs:
-            raise FileNotFoundError(f"No checkpoint directories found in {base_dir}")
-
-        checkpoint_dirs.sort(key=lambda x: x[0], reverse=True)
-        return checkpoint_dirs[0][1]
-
-    def load_models(self):
-        """Load all required models"""
+        self.response_cache = EnhancedCache(config.max_cache_size)
+        self.performance_monitor = PerformanceMonitor()
+        self.conversation_history = []
+        
+        # UCS Integration
+        self.ucs = None
+        self.ucs_enabled = config.use_ucs and HAS_NUMPY
+        self._last_auto_save = time.time()
+        
+        self.stats = {
+            'total_responses': 0,
+            'method_counts': {},
+            'error_count': 0,
+            'ucs_retrievals': 0,
+            'ucs_expert_calls': 0
+        }
+        
+        self.generation_configs = self._create_generation_configs()
+    
+    def _create_generation_configs(self) -> List[Dict]:
+        """Generation configs optimized for reasoning models"""
+        return [
+            {
+                'name': 'balanced',
+                'max_new_tokens': 768,
+                'do_sample': True,
+                'temperature': 0.8,
+                'top_p': 0.95,
+                'top_k': 50,
+                'repetition_penalty': 1.1,
+            },
+            {
+                'name': 'creative',
+                'max_new_tokens': 800,
+                'do_sample': True,
+                'temperature': 0.95,
+                'top_p': 0.95,
+                'top_k': 60,
+                'repetition_penalty': 1.1,
+            },
+            {
+                'name': 'focused',
+                'max_new_tokens': 512,
+                'do_sample': True,
+                'temperature': 0.7,
+                'top_p': 0.85,
+                'top_k': 40,
+                'repetition_penalty': 1.15,
+            }
+        ]
+    
+    def load_models(self) -> bool:
+        """Load Rhizome model and UCS system"""
         try:
-            print("🔄 Loading DialoGPT model and tokenizer...")
-            checkpoint_path = self.find_latest_checkpoint(BASE_DIR)
+            # Load language model
+            logger.info(f"📄 Loading from {config.base_dir}...")
+            checkpoint_path = self._find_latest_checkpoint(config.base_dir)
+            
+            if not checkpoint_path:
+                logger.error(f"No valid model or checkpoint found in {config.base_dir}")
+                return False
+
+            logger.info(f"✅ Found latest model/checkpoint at: {checkpoint_path}")
 
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                self.tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
-                self.model = AutoModelForCausalLM.from_pretrained(checkpoint_path)
+                try:
+                    self.tokenizer = AutoTokenizer.from_pretrained(
+                        checkpoint_path,
+                        trust_remote_code=True
+                    )
+                    logger.info("✅ Tokenizer loaded successfully")
+                except Exception as e:
+                    logger.error(f"Tokenizer loading failed: {e}")
+                    raise
 
+                try:
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        checkpoint_path,
+                        torch_dtype=torch.float16 if DEVICE.type in ['cuda', 'mps'] else torch.float32,
+                        device_map={'': DEVICE},
+                        trust_remote_code=True,
+                        low_cpu_mem_usage=True
+                    )
+                    logger.info("✅ Model loaded successfully")
+                except Exception as e:
+                    logger.error(f"Model loading failed: {e}")
+                    raise
+                
                 if self.tokenizer.pad_token is None:
                     self.tokenizer.pad_token = self.tokenizer.eos_token
                     self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-
-                self.model.to(DEVICE).eval()
-                # Apply half precision if CUDA is available for faster inference
-                if torch.cuda.is_available():
-                    self.model = self.model.half()
-                    print("✅ Model converted to half precision (FP16)")
-                print(f"Model device: {next(self.model.parameters()).device}")
-                print(f"CUDA available: {torch.cuda.is_available()}")
-
-
-            # Load coherence model
-            if USE_COHERENCE:
-                print("🔄 Loading coherence model...")
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    self.coherence_model = SentenceTransformer("all-MiniLM-L6-v2")
-
-            # Load Kokoro TTS pipeline
-            if KOKORO_AVAILABLE:
-                print("🔄 Loading Kokoro TTS pipeline...")
+                
+                self.model.eval()
+                logger.info(f"✅ Model loaded on {DEVICE}")
+            
+            # Initialize UCS
+            if self.ucs_enabled:
+                logger.info("🧠 Initializing UCS v3.4.1...")
                 try:
-                    self.tts_pipeline = KPipeline(lang_code='a')
-                    print("✅ Kokoro TTS loaded successfully")
+                    # Suppress Ray warnings
+                    import os
+                    os.environ["RAY_SILENCE_IMPORT_WARNINGS"] = "1"
+                    os.environ["RAY_DISABLE_MEMORY_MONITOR"] = "1"
+                    
+                    self.ucs = UnifiedCognitionSystem(
+                        use_advanced_search=True,
+                        embed_model=config.ucs_embed_model if HAS_SENTENCE_TRANSFORMERS else None
+                    )
+                    
+                    # Load existing memory if available
+                    if os.path.exists(config.ucs_save_path):
+                        logger.info(f"📂 Loading existing memory from {config.ucs_save_path}")
+                        try:
+                            loaded_mem = VectorMemory.load_state(config.ucs_save_path)
+                            if loaded_mem:
+                                self.ucs.vmem = loaded_mem
+                                logger.info(f"✅ Loaded {len(loaded_mem.embeddings)} mementos")
+                            else:
+                                logger.warning("Load returned None, initializing fresh memory")
+                                self.ucs._ensure_memory()
+                        except Exception as load_error:
+                            logger.warning(f"Failed to load memory: {load_error}, starting fresh")
+                            self.ucs._ensure_memory()
+                    else:
+                        self.ucs._ensure_memory()
+                    
+                    # Register conversation expert
+                    self._register_conversation_expert()
+                    
+                    logger.info("✅ UCS initialized successfully")
+                    logger.info(f"   - Dimension: {self.ucs._dim}")
+                    logger.info(f"   - Mementos: {len(self.ucs.vmem.embeddings) if self.ucs.vmem else 0}")
+                    logger.info(f"   - Experts: {len(self.ucs.expert_manager.experts)}")
+                    
                 except Exception as e:
-                    print(f"⚠️ Failed to load Kokoro TTS: {e}")
-                    self.tts_pipeline = None
-
+                    logger.error(f"UCS initialization failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    self.ucs_enabled = False
+                    self.ucs = None
+            
+            # Load TTS if available
+            if KOKORO_AVAILABLE:
+                logger.info("📄 Loading Kokoro TTS...")
+                try:
+                    # Force CPU for Kokoro to avoid CUDA issues
+                    tts_device = 'cpu'
+                    logger.info(f"Loading TTS on {tts_device} (CPU is most reliable)")
+                    tts_pipeline = KPipeline(lang_code='a', device=tts_device)
+                    self.tts_processor = AsyncTTSProcessor(tts_pipeline)
+                    logger.info("✅ TTS loaded on CPU")
+                except Exception as e:
+                    logger.warning(f"TTS failed: {e}")
+                    self.tts_processor = None
+            
             # Load voice transcriber
             if VOSK_AVAILABLE:
-                print("🔄 Loading voice transcriber...")
-                self.voice_transcriber = VoiceTranscriber()
-
-            # Get generation configs (only used by the original generate_response)
-            self.gen_configs = self.get_model_generation_params()
+                logger.info("📄 Loading voice transcriber...")
+                self.voice_transcriber = EnhancedVoiceTranscriber()
             
-            self.pre_warm_model() # Pre-warm the model after loading
-
-            print("✅ All models loaded successfully!")
+            self._pre_warm_model()
+            logger.info("✅ All models loaded!")
             return True
-
-        except Exception as e:
-            print(f"❌ Failed to load models: {e}")
-            return False
             
-    def pre_warm_model(self):
-        """Pre-warm the model with a dummy inference"""
-        dummy_input = "Hello"
-        print("🔥 Pre-warming model...")
-        with torch.no_grad():
-            inputs = self.tokenizer(dummy_input, return_tensors="pt").to(DEVICE)
-            _ = self.model.generate(**inputs, max_new_tokens=1)
-        print("🔥 Model pre-warmed for faster first inference")
-
-    def optimize_memory(self):
-        """Clear memory between requests"""
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect() # Garbage collection
-
-
-    def get_model_generation_params(self):
-        """Get generation parameters that work with this specific model"""
-        supports_temperature = supports_top_k = supports_top_p = False
-
-        try:
-            dummy_text = "Hello"
-            dummy_encoded = self.tokenizer(
-                dummy_text,
-                return_tensors="pt",
-                return_attention_mask=True,
-                padding=True
-            )
-            dummy_input = {k: v.to(DEVICE) for k, v in dummy_encoded.items()}
-
-            with torch.no_grad():
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-
-                    # Test parameters
-                    for param_name, param_value in [
-                        ("temperature", 0.7), ("top_k", 50), ("top_p", 0.9)
-                    ]:
-                        try:
-                            self.model.generate(
-                                input_ids=dummy_input["input_ids"],
-                                attention_mask=dummy_input["attention_mask"],
-                                max_new_tokens=1,
-                                do_sample=True,
-                                pad_token_id=self.tokenizer.pad_token_id,
-                                **{param_name: param_value}
-                            )
-                            if param_name == "temperature":
-                                supports_temperature = True
-                            elif param_name == "top_k":
-                                supports_top_k = True
-                            elif param_name == "top_p":
-                                supports_top_p = True
-                        except:
-                            pass
-        except:
-            pass
-
-        # Create configurations
-        configs = []
-
-        config1 = {
-            "max_new_tokens": 35,
-            "repetition_penalty": 1.8,
-            "no_repeat_ngram_size": 3,
-            "do_sample": True,
-        }
-        if supports_temperature: config1["temperature"] = 0.6
-        if supports_top_k: config1["top_k"] = 25
-        if supports_top_p: config1["top_p"] = 0.8
-        configs.append(config1)
-
-        config2 = {
-            "max_new_tokens": 50,
-            "repetition_penalty": 1.6,
-            "no_repeat_ngram_size": 4,
-            "do_sample": True,
-        }
-        if supports_temperature: config2["temperature"] = 0.7
-        if supports_top_k: config2["top_k"] = 30
-        if supports_top_p: config2["top_p"] = 0.85
-        configs.append(config2)
-
-        config3 = {
-            "max_new_tokens": 30,
-            "do_sample": False,
-            "repetition_penalty": 1.5,
-        }
-        configs.append(config3)
-
-        return configs
-
-    def is_response_problematic(self, response, user_input):
-        """Check for problematic response patterns"""
-        if not response or len(response.strip()) < 15:
-            return True, "too_short"
-
-        response_lower = response.lower()
-
-        # Check for deflection patterns
-        deflection_patterns = [
-            r'what do you (do|think|feel)',
-            r'how (do|does) you',
-            r"that's (what|how|why) you",
-            r'you (should|need to|have to)',
-            r"what about you",
-            r"how about you",
-        ]
-
-        for pattern in deflection_patterns:
-            if re.search(pattern, response_lower):
-                return True, "deflection"
-
-        # Check for circular patterns
-        problematic_patterns = [
-            r"that's (the|what|why|how) (beauty|part|thing|point)",
-            r"it'?s (not|just) (like|that|what)",
-            r"that'?s (not|just) (something|what|how)",
-            r"it (just )?means that",
-        ]
-
-        for pattern in problematic_patterns:
-            if re.search(pattern, response_lower):
-                return True, "circular"
-
-        return False, "valid"
-
-    def clean_and_truncate_response(self, response):
-        """Clean response and truncate at natural stopping points"""
-        if not response.strip():
-            return ""
-
-        # Remove special tokens and formatting
-        response = re.sub(r'<\|[^|]*\|>', '', response)
-        response = re.sub(r'</?[^>]+>', '', response)
-        response = re.sub(r'\*+', '', response)
-        response = re.sub(r'#+\s*', '', response)
-        response = re.sub(r'^\s*[-*+•]\s+', '', response, flags=re.MULTILINE)
-        response = ''.join(c for c in response if c.isprintable() or c.isspace())
-        response = re.sub(r'\s+([.,!?;:])', r'\1', response)
-        response = re.sub(r'\s{2,}', ' ', response)
-        response = response.strip()
-
-        # Split into sentences and filter
-        sentences = re.split(r'[.!?]+', response)
-        good_sentences = []
-
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if len(sentence) < 8:
-                continue
-
-            # Skip problematic sentence patterns
-            sentence_lower = sentence.lower()
-            skip_patterns = [
-                r"that'?s (the|what|why)",
-                r"it (just )?means",
-                r"you'?re (right|thinking)",
-                r"what (do|does) you",
-            ]
-
-            should_skip = any(re.search(pattern, sentence_lower) for pattern in skip_patterns)
-
-            if not should_skip:
-                good_sentences.append(sentence)
-
-        if good_sentences:
-            if len(good_sentences[0]) > 50:
-                result = good_sentences[0]
-            elif len(good_sentences) > 1:
-                result = good_sentences[0] + '. ' + good_sentences[1]
-            else:
-                result = good_sentences[0]
-
-            if not result.endswith(('.', '!', '?')):
-                result += '.'
-
-            return result
-
-        return ""
-
-    def create_proper_input(self, user_input):
-        """Create properly formatted input with attention mask"""
-        formats = [
-            f"<|user|>\n{user_input}\n<|assistant|>\n",
-            f"User: {user_input}\nAssistant:",
-            user_input + self.tokenizer.eos_token
-        ]
-
-        results = []
-        for fmt in formats:
-            encoded = self.tokenizer(
-                fmt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=400,
-                padding=True,
-                return_attention_mask=True
-            )
-            results.append((encoded, fmt))
-
-        return results
-
-    def generate_response(self, user_input):
-        """
-        Original generate response method with multiple attempts and validation.
-        This method is now de-prioritized by the optimized chat_response_optimized.
-        """
-        input_formats = self.create_proper_input(user_input)
-        all_candidates = []
-
-        for input_data, format_name in input_formats:
-            input_data = {k: v.to(DEVICE) for k, v in input_data.items()}
-
-            for i, config in enumerate(self.gen_configs):
-                try:
-                    with torch.no_grad():
-                        outputs = self.model.generate(
-                            input_ids=input_data["input_ids"],
-                            attention_mask=input_data["attention_mask"],
-                            pad_token_id=self.tokenizer.pad_token_id,
-                            eos_token_id=self.tokenizer.eos_token_id,
-                            **config
-                        )
-
-                    new_tokens = outputs[0][input_data["input_ids"].shape[1]:]
-                    response = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-
-                    if response.strip():
-                        cleaned = self.clean_and_truncate_response(response)
-                        if cleaned:
-                            all_candidates.append((cleaned, f"{format_name[:6]}-{i+1}"))
-
-                except Exception:
-                    continue
-
-        # Evaluate candidates
-        valid_candidates = []
-        for response, method in all_candidates:
-            is_problematic, reason = self.is_response_problematic(response, user_input)
-
-            if not is_problematic:
-                coherence_score = 0
-                if self.coherence_model:
-                    try:
-                        embeddings = self.coherence_model.encode([user_input, response])
-                        coherence_score = np.dot(embeddings[0], embeddings[1]) / (
-                            np.linalg.norm(embeddings[0]) * np.linalg.norm(embeddings[1])
-                        )
-                    except:
-                        coherence_score = 0
-
-                valid_candidates.append((response, method, coherence_score))
-
-        # Return best candidate
-        if valid_candidates:
-            if self.coherence_model and USE_COHERENCE:
-                valid_candidates.sort(key=lambda x: x[2], reverse=True)
-                if valid_candidates[0][2] >= COHERENCE_THRESHOLD:
-                    return valid_candidates[0][0], valid_candidates[0][1]
-            else:
-                return valid_candidates[0][0], valid_candidates[0][1]
-
-        # Fallback responses
-        fallback_responses = [
-            "I find that question challenging to approach directly.",
-            "That's a complex topic that deserves more careful consideration.",
-            "I'm not sure I have the right framework to answer that well.",
-            "That touches on some deep questions I'm still thinking through.",
-            "I'd need to reflect more on that before giving you a meaningful response."
-        ]
-
-        return np.random.choice(fallback_responses), "fallback"
-
-    def generate_response_fast(self, user_input):
-        """Faster response generation with single inference call and optimized config"""
-        # Use only the best format and config
-        user_input_formatted = f"<|user|>\n{user_input}\n<|assistant|>\n"
-
-        encoded = self.tokenizer(
-            user_input_formatted,
-            return_tensors="pt",
-            truncation=True,
-            max_length=400,
-            padding=True,
-            return_attention_mask=True
+        except Exception as e:
+            logger.error(f"Failed to load models: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def _register_conversation_expert(self):
+        """Register custom expert for conversational context"""
+        def conversation_context_expert(ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            """Expert that enriches context with conversation history"""
+            prompt = ctx.get("prompt", "")
+            
+            # Check if we need context from memory
+            if any(word in prompt.lower() for word in ["remember", "earlier", "before", "you said"]):
+                return {"operation": "RETRIEVE", "query": prompt}
+            
+            return None
+        
+        self.ucs.expert_manager.register_expert(
+            "conversation_context",
+            conversation_context_expert,
+            phase="propose",
+            expertise_tags=["conversation", "memory", "context"]
         )
+    
+    def _find_latest_checkpoint(self, base_dir: str) -> Optional[str]:
+        """Find latest checkpoint or use base dir if it's a valid model directory"""
+        base_path = Path(base_dir)
+        
+        if not base_path.exists() or not base_path.is_dir():
+            logger.error(f"Directory not found or is not a directory: {base_dir}")
+            return None
+        
+        logger.info(f"🔍 Scanning directory: {base_dir}")
+        
+        # Check for checkpoint subdirectories
+        checkpoints = []
+        for item in base_path.iterdir():
+            if item.is_dir() and item.name.startswith("checkpoint-"):
+                try:
+                    num = int(item.name.split("-")[1])
+                    checkpoints.append((num, item))
+                except (IndexError, ValueError):
+                    continue
+        
+        if checkpoints:
+            latest_checkpoint_path = max(checkpoints, key=lambda x: x[0])[1]
+            logger.info(f"🎯 Selected latest checkpoint: {latest_checkpoint_path}")
+            return str(latest_checkpoint_path)
 
-        input_data = {k: v.to(DEVICE) for k, v in encoded.items()}
+        # If no checkpoints, check if the base directory itself is a model
+        model_files = [
+            base_path / "config.json",
+            base_path / "pytorch_model.bin",
+            base_path / "model.safetensors"
+        ]
+        if any(f.exists() for f in model_files):
+            logger.info("✅ Using base directory as model path")
+            return str(base_path)
 
-        # Use a single, optimized config
-        config = {
-            "max_new_tokens": 35,
-            "repetition_penalty": 1.8,
-            "no_repeat_ngram_size": 3,
-            "do_sample": True,
-            "temperature": 0.6,
-            "top_k": 25,
-            "top_p": 0.8,
-        }
+        return None
 
+    def _pre_warm_model(self):
+        """Warm up the model"""
+        logger.info("🔥 Pre-warming model...")
+        dummy_input = "Hello"
+        
+        with torch_inference_mode():
+            inputs = self.tokenizer(
+                dummy_input, 
+                return_tensors="pt",
+                padding=True,
+                truncation=True
+            ).to(DEVICE)
+            
+            _ = self.model.generate(
+                **inputs,
+                max_new_tokens=10,
+                do_sample=False,
+                pad_token_id=self.tokenizer.pad_token_id
+            )
+        
+        logger.info("✅ Model pre-warmed")
+
+    def _format_prompt_for_Rhizome(self, user_input: str, system_prompt: Optional[str] = None,
+                                   retrieved_context: Optional[str] = None) -> str:
+        """
+        Format prompt with optional retrieved context from UCS
+        """
+        formatted = ""
+        
+        # Use provided system prompt or default
+        if system_prompt:
+            formatted += f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        
+        # Add retrieved context if available
+        if retrieved_context:
+            formatted += f"<|im_start|>system\nRelevant context from memory:\n{retrieved_context}<|im_end|>\n"
+        
+        formatted += f"<|im_start|>user\n{user_input}<|im_end|>\n<|im_start|>assistant\n"
+        return formatted
+    
+    def _extract_response_from_output(self, full_output: str, show_reasoning: bool = False) -> str:
+        """Extract final response from Rhizome output"""
+        if "<|im_start|>assistant" in full_output:
+            full_output = full_output.split("<|im_start|>assistant", 1)[-1]
+        
+        # Handle thinking blocks
+        if "<think>" in full_output and "</think>" in full_output:
+            think_pattern = r'<think>(.*?)</think>'
+            reasoning_blocks = re.findall(think_pattern, full_output, re.DOTALL)
+            
+            response = re.sub(think_pattern, '', full_output, flags=re.DOTALL)
+            
+            if show_reasoning and reasoning_blocks:
+                reasoning_text = "\n\n".join([f"💭 **Reasoning:**\n{r.strip()}" for r in reasoning_blocks])
+                response = f"{reasoning_text}\n\n**Answer:**\n{response.strip()}"
+        else:
+            response = full_output
+        
+        # Clean up response
+        response = response.strip()
+        response = re.sub(r'<\|im.*?\|>', '', response)
+        response = re.sub(r'^(User|Assistant):\s*', '', response, flags=re.IGNORECASE)
+        response = re.sub(r'\n(User|Assistant):\s*.*$', '', response, flags=re.IGNORECASE | re.MULTILINE)
+        response = re.sub(r'\n{3,}', '\n\n', response)
+        response = re.sub(r' {2,}', ' ', response)
+        
+        return response.strip()
+    
+    async def _retrieve_context_from_ucs(self, user_input: str) -> Tuple[Optional[str], List[Tuple[str, float]]]:
+        """Retrieve relevant context from UCS memory (lightweight version)"""
+        if not self.ucs_enabled or not self.ucs:
+            return None, []
+        
         try:
-            with torch.no_grad():
+            # Fast path: Direct memory retrieval without full cognitive loop
+            # This avoids the expensive expert system deliberation
+            
+            # Check if query needs memory retrieval
+            needs_retrieval = any(word in user_input.lower() for word in 
+                                 ["remember", "earlier", "before", "you said", "we talked", 
+                                  "you mentioned", "last time", "previously"])
+            
+            if not needs_retrieval and len(user_input.split()) < 15:
+                # Short queries without memory keywords - skip retrieval
+                return None, []
+            
+            # Direct vector retrieval (fast)
+            query_vec = self.ucs._embed(user_input)
+            retrieved_mementos = self.ucs.vmem.retrieve(
+                query_vec, 
+                top_k=3,  # Reduced from 5 for speed
+                use_advanced=True,
+                use_cache=True
+            )
+            
+            self.stats['ucs_retrievals'] += 1
+            
+            if not retrieved_mementos:
+                return None, []
+            
+            # Build context from top mementos
+            context_parts = []
+            for mid, score in retrieved_mementos:
+                if score < 0.5:  # Skip low-relevance results
+                    continue
+                    
+                if mid in self.ucs.vmem.mementos:
+                    content = self.ucs.vmem.mementos[mid].get('content', '')
+                    if content:
+                        # Trim long content
+                        content_preview = content[:150] + "..." if len(content) > 150 else content
+                        context_parts.append(f"[{score:.2f}] {content_preview}")
+            
+            context_text = "\n".join(context_parts) if context_parts else None
+            
+            logger.debug(f"📚 Retrieved {len(retrieved_mementos)} mementos in fast mode")
+            
+            return context_text, retrieved_mementos
+            
+        except Exception as e:
+            logger.warning(f"UCS retrieval failed: {e}")
+            return None, []
+    
+    def _store_conversation_in_ucs(self, user_input: str, response: str):
+        """Store conversation turn in UCS memory"""
+        if not self.ucs_enabled or not self.ucs or not self.ucs.vmem:
+            return
+        
+        try:
+            # Create conversation memento
+            conversation_text = f"User: {user_input}\nAssistant: {response}"
+            mid = f"conv_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+            
+            # Embed and store
+            emb = self.ucs._embed(conversation_text)
+            self.ucs.vmem.add_memento(
+                mid=mid,
+                emb=emb,
+                tags=["conversation", "rhizome"],
+                reliability=0.8,
+                content=conversation_text,
+                source="chat"
+            )
+            
+            logger.debug(f"Stored conversation memento: {mid}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to store conversation: {e}")
+    
+    def _auto_save_ucs(self):
+        """Auto-save UCS memory periodically"""
+        if not self.ucs_enabled or not self.ucs or not self.ucs.vmem:
+            return
+        
+        current_time = time.time()
+        if current_time - self._last_auto_save > config.ucs_auto_save_interval:
+            try:
+                logger.info(f"💾 Auto-saving UCS memory to {config.ucs_save_path}")
+                
+                # Wait for any pending indexing to complete
+                if self.ucs.vmem.use_advanced_search and hasattr(self.ucs.vmem, '_index_queue'):
+                    timeout = time.time() + 5
+                    while self.ucs.vmem._index_queue.qsize() > 0 and time.time() < timeout:
+                        time.sleep(0.2)
+                
+                # Use JSON format which handles journal IDs better
+                self.ucs.vmem.save_state(config.ucs_save_path)
+                self._last_auto_save = current_time
+                logger.info(f"✅ Saved {len(self.ucs.vmem.embeddings)} mementos")
+                
+            except Exception as e:
+                logger.error(f"Auto-save failed: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    async def generate_response_optimized(self, user_input: str, show_reasoning: bool = False,
+                                         use_ucs: bool = True, temperature: float = None,
+                                         top_p: float = None, top_k: int = None,
+                                         max_tokens: int = None, system_prompt: str = None) -> Tuple[str, str]:
+        """Generate response with optional UCS augmentation and custom parameters"""
+        start_time = time.perf_counter()
+        
+        # Check cache
+        cache_key = f"{user_input}|{show_reasoning}|{use_ucs}|{temperature}|{top_p}|{top_k}|{max_tokens}|{system_prompt}"
+        cached_response = self.response_cache.get(cache_key)
+        if cached_response:
+            duration = time.perf_counter() - start_time
+            self.performance_monitor.log_response_time(duration, "cached")
+            return cached_response, "cached"
+        
+        # Retrieve context from UCS if enabled
+        retrieved_context = None
+        retrieved_mementos = []
+        
+        if use_ucs and self.ucs_enabled:
+            try:
+                retrieved_context, retrieved_mementos = await self._retrieve_context_from_ucs(user_input)
+                if retrieved_context:
+                    logger.info(f"📚 Retrieved {len(retrieved_mementos)} relevant mementos")
+            except Exception as e:
+                logger.warning(f"UCS retrieval error: {e}")
+        
+        # Select generation config
+        config_idx = self._select_generation_config(user_input)
+        gen_config = self.generation_configs[config_idx].copy()
+        
+        # Override with custom parameters if provided
+        if temperature is not None:
+            gen_config['temperature'] = temperature
+        if top_p is not None:
+            gen_config['top_p'] = top_p
+        if top_k is not None:
+            gen_config['top_k'] = top_k
+        if max_tokens is not None:
+            gen_config['max_new_tokens'] = max_tokens
+        
+        method = f"{'ucs_' if retrieved_context else ''}optimized_{gen_config['name']}"
+        
+        try:
+            # Use provided system prompt or default
+            if system_prompt is None or not system_prompt.strip():
+                system_prompt = (
+                    "You are a helpful assistant engaged in natural conversation. "
+                    "Use any retrieved context naturally without explicitly mentioning it. "
+                    "Stay conversational, witty, and emotionally intelligent."
+                )
+            
+            formatted_input = self._format_prompt_for_Rhizome(
+                user_input, 
+                system_prompt,
+                retrieved_context
+            )
+            
+            with torch_inference_mode():
+                inputs = self.tokenizer(
+                    formatted_input,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=2048
+                ).to(DEVICE)
+                
+                input_length = inputs.input_ids.shape[1]
+                
                 outputs = self.model.generate(
-                    input_ids=input_data["input_ids"],
-                    attention_mask=input_data["attention_mask"],
+                    **inputs,
+                    **{k: v for k, v in gen_config.items() if k != 'name'},
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
-                    **config
+                    use_cache=True,
                 )
-
-            new_tokens = outputs[0][input_data["input_ids"].shape[1]:]
-            response = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-            cleaned = self.clean_and_truncate_response(response)
-
-            if cleaned and len(cleaned.strip()) > 15:
-                return cleaned, "fast_single"
+            
+            # Decode only generated tokens
+            generated_ids = outputs[0][input_length:]
+            if len(generated_ids) == 0:
+                logger.warning("No tokens generated - Falling back.")
+                return self._get_fallback_response(user_input)
+            
+            raw_response = self.tokenizer.decode(
+                generated_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True
+            )
+            
+            # Extract and clean response
+            response = self._extract_response_from_output(raw_response, show_reasoning)
+            
+            if response and len(response) > 5:
+                self.response_cache.put(cache_key, response)
+                
+                # Store in UCS memory
+                if use_ucs and self.ucs_enabled:
+                    self._store_conversation_in_ucs(user_input, response)
+                    self._auto_save_ucs()
+                
+                duration = time.perf_counter() - start_time
+                self.performance_monitor.log_response_time(duration, method)
+                
+                return response, method
             else:
-                # Simple fallback without multiple attempts
-                fallback_responses = [
-                    "I find that question challenging to approach directly.",
-                    "That's a complex topic that deserves more careful consideration.",
-                    "I'm not sure I have the right framework to answer that well."
-                ]
-                return np.random.choice(fallback_responses), "fallback"
-
+                logger.warning("Empty or too short response, using fallback")
+                return self._get_fallback_response(user_input)
+            
         except Exception as e:
-            print(f"Fast generation error: {e}")
-            return "I'm having trouble processing that right now.", "error"
+            logger.error(f"Generation error: {e}")
+            import traceback
+            traceback.print_exc()
+            self.stats['error_count'] += 1
+            return self._get_fallback_response(user_input)
     
-    def generate_response_ultra_fast(self, user_input):
-        """Ultra-optimized single inference with minimal overhead"""
-        # Pre-format without multiple attempts
-        formatted_input = f"<|user|>\n{user_input}\n<|assistant|>\n"
+    def _select_generation_config(self, user_input: str) -> int:
+        """Select appropriate generation config"""
+        normalized_input = user_input.lower()
+        input_length = len(user_input.split())
         
-        # Single tokenization call
-        with torch.no_grad():
-            inputs = self.tokenizer(
-                formatted_input,
-                return_tensors="pt",
-                max_length=300,  # Reduced from 400
-                truncation=True,
-                padding=False  # Skip padding for single input
-            ).to(DEVICE)
-            
-            # Streamlined generation config
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=30,  # Reduced for faster generation
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.9,
-                repetition_penalty=1.5,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                use_cache=True  # Enable KV caching
-            )
+        # Use creative for complex reasoning questions
+        if any(word in normalized_input for word in ['why', 'how', 'explain', 'analyze', 'compare', 'what if']):
+            return 1  # creative
         
-        # Quick decode and clean
-        response = self.tokenizer.decode(
-            outputs[0][inputs.input_ids.shape[1]:],  
-            skip_special_tokens=True
-        ).strip()
+        # Focused for short queries
+        if input_length < 5:
+            return 2  # focused
         
-        # Minimal cleaning
-        if len(response) > 10:
-            # Quick sentence boundary detection
-            sentences = response.split('. ')
-            if sentences:
-                clean_response = sentences[0]
-                if not clean_response.endswith('.'):
-                    clean_response += '.'
-                return clean_response, "ultra_fast"
-        
-        return "That's interesting to think about.", "ultra_fallback"
-
-    def generate_response_ludicrous_speed(self, user_input):
-        """Ludicrous speed - every millisecond counts"""
-        # Skip the formatting overhead - direct tokenization
-        with torch.no_grad():
-            # Minimal tokenization
-            inputs = self.tokenizer(
-                user_input + " " + self.tokenizer.eos_token,  # Simpler format
-                return_tensors="pt",
-                max_length=250,  # Even shorter context
-                truncation=True,
-                add_special_tokens=False  # Skip special token processing
-            ).to(DEVICE)
-            
-            # Aggressive generation settings for speed
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=25,  # Shorter responses = faster generation
-                do_sample=False,  # Greedy decoding is faster than sampling
-                repetition_penalty=1.3,  # Lighter penalty
-                pad_token_id=self.tokenizer.pad_token_id,
-                use_cache=True,
-                early_stopping=True  # Stop as soon as EOS is generated
-            )
-        
-        # Ultra-minimal processing
-        response = self.tokenizer.decode(
-            outputs[0][inputs.input_ids.shape[1]:],  
-            skip_special_tokens=True
-        ).strip()
-        
-        # No cleaning - just basic sentence completion
-        if len(response) > 5:
-            if not response.endswith(('.', '!', '?')):
-                response += '.'
-            return response[:80], "ludicrous"  # Cap at 80 chars
-        
-        return "I see.", "ludicrous_fallback"
-
-    def generate_speech(self, text, voice='af_heart', speed=1.0):
-        """Generate speech audio from text using Kokoro TTS"""
-        if not self.tts_pipeline:
-            return None
-
-        try:
-            # Clean text for better TTS synthesis
-            clean_text = re.sub(r'[^\w\s.,!?;:-]', '', text)
-            clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-
-            if not clean_text:
-                return None
-
-            print(f"🔊 Generating speech for: {clean_text[:50]}...")
-
-            # Generate speech using Kokoro pipeline
-            generator = self.tts_pipeline(
-                clean_text,
-                voice=voice,
-                speed=speed,
-                split_pattern=r'\n+'
-            )
-
-            # Collect all audio segments
-            audio_segments = []
-            for i, (graphemes, phonemes, audio) in enumerate(generator):
-                audio_segments.append(audio)
-                print(f"  Generated segment {i+1}: {graphemes[:30]}...")
-
-            if not audio_segments:
-                return None
-
-            # Concatenate audio segments if multiple
-            final_audio = np.concatenate(audio_segments) if len(audio_segments) > 1 else audio_segments[0]
-
-            # Save to temporary file
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-            sf.write(temp_file.name, final_audio, 24000)
-
-            print(f"✅ Audio saved to: {temp_file.name}")
-            return temp_file.name
-
-        except Exception as e:
-            print(f"❌ TTS Error: {e}")
-            return None
-
-    def generate_speech_fast(self, text, voice='af_heart', speed=1.0):
-        """Faster TTS with early exit for long texts"""
-        if not self.tts_pipeline or len(text) > 150:  # Skip TTS for long responses
-            return None
-            
-        try:
-            # Minimal text cleaning
-            clean_text = re.sub(r'[^\w\s.,!?;:-]', '', text)[:100]  # Truncate at 100 chars
-            if not clean_text:
-                return None
-            
-            # Single segment generation (no splitting)
-            audio_gen = self.tts_pipeline(clean_text, voice=voice, speed=speed)
-            audio_segment = next(audio_gen)[2]  # Get first (and likely only) segment
-            
-            # Direct file write
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-            sf.write(temp_file.name, audio_segment, 24000)
-            return temp_file.name
-            
-        except Exception as e:
-            print(f"⚡ Fast TTS Error: {e}")
-            return None
-            
-    def generate_speech_lightning(self, text, voice='af_heart', speed=1.0):
-        """Lightning TTS - absolute minimum processing"""
-        if not self.tts_pipeline or len(text) > 80:
-            return None
-            
-        try:
-            # No text cleaning - just generate, cap at 60 chars
-            audio_gen = self.tts_pipeline(text[:60], voice=voice, speed=speed)
-            audio_segment = next(audio_gen)[2]
-            
-            # Write directly without temp file naming overhead
-            filename = f"/tmp/tts_{uuid.uuid4().hex[:8]}.wav"
-            sf.write(filename, audio_segment, 24000)
-            return filename
-            
-        except Exception as e: # Catch the exception for debugging
-            print(f"⚡ Lightning TTS Error: {e}")
-            return None
-
-
-    def transcribe_voice_input(self, audio_file_path):
-        """Transcribe voice input to text"""
-        if not self.voice_transcriber:
-            return "❌ Voice transcription not available"
-
-        if not audio_file_path:
-            return "❌ No audio file provided"
-
-        return self.voice_transcriber.transcribe_audio(audio_file_path)
-
-    # Renamed original chat_response to chat_response_old
-    def chat_response_old(self, user_input, history, enable_tts, voice_selection, speed):
-        """Original main chat function for Gradio interface"""
+        # Default balanced
+        return 0
+    
+    def _get_fallback_response(self, user_input: str) -> Tuple[str, str]:
+        """Simple fallback response"""
+        fallbacks = [
+            "I'm not quite sure how to respond to that. Could you rephrase?",
+            "That's an interesting question. Could you provide more context?",
+            "I need a bit more information to give you a good answer.",
+            "Could you ask that in a different way?"
+        ]
+        return np.random.choice(fallbacks), "fallback"
+    
+    async def chat_response_parallel(self, user_input: str, history: List, enable_tts: bool, 
+                             voice: str, speed: float, show_reasoning: bool = False,
+                             use_ucs: bool = True, temperature: float = None,
+                             top_p: float = None, top_k: int = None,
+                             max_tokens: int = None, system_prompt: str = None) -> Tuple[List, str, Optional[str]]:
+        """Main chat response function with UCS integration"""
         if not user_input.strip():
             return history, "", None
-
-        # Generate text response
-        self.conversation_count += 1
-        response, method = self.generate_response(user_input)
-
-        if method == "fallback":
-            self.fallback_count += 1
-
-        self.method_counts[method] = self.method_counts.get(method, 0) + 1
-
-        # Add to history
-        history.append([user_input, response])
-
-        # Generate audio if TTS is enabled
-        audio_file = None
-        if enable_tts and self.tts_pipeline:
-            audio_file = self.generate_speech(response, voice=voice_selection, speed=speed)
-
-        return history, "", audio_file
-
-    def chat_response_optimized(self, user_input, history, enable_tts, voice_selection, speed):
-        """Optimized chat function for faster responses"""
-        start_time = time.time() # Start timing
-
-        if not user_input.strip():
-            return history, "", None
-
-        # Check cache first
-        cached_response = self.response_cache.get_cached_response(user_input)
-        if cached_response:
-            response, method = cached_response, "cached"
-        else:
-            # Use the faster single-inference method
-            response, method = self.generate_response_fast(user_input)
-            self.response_cache.cache_response(user_input, response)
-
-
-        # Update stats
-        self.conversation_count += 1
-        if method == "fallback":
-            self.fallback_count += 1
-        self.method_counts[method] = self.method_counts.get(method, 0) + 1
-
-        # Add to history
-        history.append([user_input, response])
-
-        # Generate audio only if explicitly requested and available and response is not too long
-        audio_file = None
-        if enable_tts and self.tts_pipeline and len(response) < 200:
-            audio_file = self.generate_speech(response, voice=voice_selection, speed=speed)
-
-        end_time = time.time() # End timing
-        print(f"⏱️ Response generated in {end_time - start_time:.2f}s (Method: {method})")
-
-        return history, "", audio_file
-    
-    def chat_response_ludicrous_speed(self, user_input, history, enable_tts, voice_selection, speed):
-        """The absolute fastest possible response"""
-        if not user_input.strip():
-            return history, "", None  
-        
-        start_time = time.perf_counter()  # Higher precision timing
-        
-        # Check cache first
-        cached_response = self.response_cache.get_cached_response(user_input)
-        if cached_response:
-            response, method = cached_response, "cached"
-        else:
-            # Ludicrous speed generation
-            response, method = self.generate_response_ludicrous_speed(user_input)
-            self.response_cache.cache_response(user_input, response)
-        
-        # Minimal stats (skip counting for speed)
-        self.conversation_count += 1 # Still count total conversations
-        self.method_counts[method] = self.method_counts.get(method, 0) + 1 # Track method usage
-        
-        history.append([user_input, response])
-        
-        # Lightning TTS
-        audio_file = None
-        if enable_tts and self.tts_pipeline:
-            audio_file = self.generate_speech_lightning(response, voice=voice_selection, speed=speed)
-        
-        end_time = time.perf_counter()
-        elapsed = end_time - start_time
-        print(f"⚡⚡ LUDICROUS SPEED: {elapsed:.2f}s (Method: {method})")
-        
-        # Achievement unlocked check
-        if elapsed < 8.0:
-            print("🏆 ACHIEVEMENT UNLOCKED: SUB-8 SECOND VOICE-TO-VOICE! 🏆")
-            # The original message mentioned "2013 Xeon" but I'll make it generic
-            print(f"🚀 Your system just achieved {elapsed:.2f}s - that's INSANE!")
-        
-        self.optimize_memory() # Clear memory after each request
-        
-        return history, "", audio_file
-
-    async def chat_response_parallel(self, user_input, history, enable_tts, voice_selection, speed):
-        """
-        Concept for parallel TTS generation while text is being processed.
-        Note: True parallel inference and TTS requires a more complex
-        async/threading setup not fully implemented here, as Gradio handles
-        its own async execution. This is for illustrative purposes.
-        """
-        if not user_input.strip():
-            return history, "", None  
         
         start_time = time.perf_counter()
         
-        # Generate response (this is still synchronous inference for simplicity)
-        response, method = self.generate_response_ludicrous_speed(user_input)
+        try:
+            # Generate response with UCS and custom parameters
+            response, method = await self.generate_response_optimized(
+                user_input, show_reasoning, use_ucs,
+                temperature, top_p, top_k, max_tokens, system_prompt
+            )
+            
+            # Start TTS async
+            tts_future = None
+            if enable_tts and self.tts_processor:
+                # Remove reasoning blocks for TTS
+                tts_text = re.sub(r'💭.*?\*\*Answer:\*\*\n', '', response, flags=re.DOTALL)
+                tts_text = tts_text[:config.tts_max_length]
+                if tts_text:
+                    tts_future = self.tts_processor.generate_async(tts_text, voice, speed)
+            
+            # Update history
+            history.append([user_input, response])
+            
+            # Update stats
+            self.stats['total_responses'] += 1
+            self.stats['method_counts'][method] = self.stats['method_counts'].get(method, 0) + 1
+            
+            # Get TTS result
+            audio_file = None
+            if tts_future:
+                try:
+                    audio_file = tts_future.result(timeout=10.0)  # Increased timeout for longer text
+                except Exception as tts_error:
+                    logger.warning(f"TTS timeout or error: {tts_error}")
+            
+            # Memory cleanup
+            if self.performance_monitor.should_cleanup_memory():
+                self._cleanup_memory()
+            
+            duration = time.perf_counter() - start_time
+            logger.info(f"⚡ Response in {duration:.2f}s ({method})")
+            
+            return history, "", audio_file
+            
+        except Exception as e:
+            logger.error(f"Chat response failed: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Return error message in chat
+            error_response = f"⚠️ Error generating response: {str(e)[:100]}"
+            history.append([user_input, error_response])
+            return history, "", None
+    
+    def transcribe_voice_input(self, audio_file_path: str) -> str:
+        """Transcribe audio"""
+        if not self.voice_transcriber:
+            return "❌ Voice transcription not available"
         
-        history.append([user_input, response])
+        if not audio_file_path:
+            return "❌ No audio file"
         
-        # Generate TTS (this could be done in a separate thread if response was predictable)
-        audio_file = None
-        if enable_tts and self.tts_pipeline:
-            audio_file = self.generate_speech_lightning(response, voice=voice_selection, speed=speed)
+        return self.voice_transcriber.transcribe_audio(audio_file_path)
+    
+    def _cleanup_memory(self):
+        """Clean up memory"""
+        if DEVICE.type == 'cuda':
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        elif DEVICE.type == 'mps':
+            torch.mps.empty_cache()
         
-        elapsed = time.perf_counter() - start_time
-        print(f"🔥 Parallel attempt (conceptual): {elapsed:.2f}s (Method: {method})")
+        gc.collect()
+        logger.info("🧹 Memory cleaned")
+    
+    def get_comprehensive_stats(self) -> str:
+        """Get statistics including UCS metrics"""
+        system_stats = self.performance_monitor.get_system_stats()
+        cache_stats = self.response_cache.get_stats()
         
-        self.optimize_memory()
+        if self.performance_monitor.response_times:
+            avg_time = np.mean([rt[1] for rt in self.performance_monitor.response_times[-20:]])
+        else:
+            avg_time = 0.0
         
-        return history, "", audio_file
+        method_stats_str = ""
+        if self.stats['method_counts']:
+            method_stats_str = "\n".join([f"- {method}: {count}" 
+                                          for method, count in self.stats['method_counts'].items()])
+            method_stats_str = "\n\n**Methods:**\n" + method_stats_str
+        
+        stats_report = f"""
+📊 **Session Stats:**
+- Total: {self.stats['total_responses']}
+- Avg time: {avg_time:.2f}s
+- Errors: {self.stats['error_count']}
+- Device: {DEVICE_INFO}
+- TTS: {'Yes' if self.tts_processor else 'No'}
+- STT: {'Yes' if self.voice_transcriber else 'No'}
 
+---
+🧠 **UCS Integration:**
+- Enabled: {'Yes' if self.ucs_enabled else 'No'}
+- Mementos: {len(self.ucs.vmem.embeddings) if self.ucs and self.ucs.vmem else 0}
+- Retrievals: {self.stats['ucs_retrievals']}
+- Expert Calls: {self.stats['ucs_expert_calls']}
+"""
 
-    def get_stats(self):
-        """Get current statistics"""
-        # Ensure we don't divide by zero if conversation_count is 0
-        success_rate = ((self.conversation_count - self.fallback_count) / self.conversation_count * 100) if self.conversation_count > 0 else 0
+        if self.ucs_enabled and self.ucs:
+            stats_report += f"- Experts: {len(self.ucs.expert_manager.experts)}\n"
+            if self.ucs.vmem:
+                cache_stats_ucs = self.ucs.vmem.query_cache.stats()
+                stats_report += f"- UCS Cache Hit Rate: {cache_stats_ucs['hit_rate']}\n"
 
-        # Include method counts in stats
-        method_stats = "\n".join([f"- {method}: {count}" for method, count in self.method_counts.items()])
-        if method_stats:
-            method_stats = "\n\n**Generation Methods Used:**\n" + method_stats
-
-
-        stats = f"""
-📊 **Session Statistics:**
-- Total responses: {self.conversation_count}
-- Success rate: {success_rate:.1f}%
-- Fallbacks: {self.fallback_count}
-- Device: {DEVICE}
-- TTS Available: {'Yes' if self.tts_pipeline else 'No'}
-- Voice Recognition: {'Yes' if self.voice_transcriber else 'No'}
-{method_stats}
+        stats_report += f"""
+---
+💻 **System:**
+- CPU: {system_stats.get('cpu_percent', 0):.1f}%
+- Memory: {system_stats.get('memory_percent', 0):.1f}%
+- Uptime: {system_stats.get('uptime', 0):.0f}s
+"""
+        if 'gpu_name' in DEVICE_DETAILS:
+            stats_report += f"""
+- GPU: {DEVICE_DETAILS['gpu_name']}
+- GPU Memory: {system_stats.get('gpu_memory_used', 0):.2f}/{system_stats.get('gpu_memory_total', 0):.2f}GB
+"""
+        
+        stats_report += f"""
+---
+📦 **Cache:**
+- Size: {cache_stats['size']}/{cache_stats['max_size']}
+- Hit Rate: {cache_stats['hit_rate']}
+{method_stats_str}
         """
-        return stats
-
+        return stats_report
+    
     def clear_chat(self):
-        """Clear chat history and reset stats"""
-        self.conversation_count = 0
-        self.fallback_count = 0
-        self.method_counts = {}
-        self.response_cache.cache.clear() # Clear the cache
-        self.response_cache.keys_ordered.clear()
+        """Clear chat history (preserves UCS memory)"""
+        self.stats = {
+            'total_responses': 0,
+            'method_counts': {},
+            'error_count': 0,
+            'ucs_retrievals': 0,
+            'ucs_expert_calls': 0
+        }
+        self.response_cache.clear()
+        self.performance_monitor = PerformanceMonitor()
+        self.conversation_history = []
+        logger.info("🗑️ Chat cleared")
         return []
+    
+    def save_ucs_memory(self) -> str:
+        """Manually save UCS memory"""
+        if not self.ucs_enabled or not self.ucs or not self.ucs.vmem:
+            return "❌ UCS not enabled"
+        
+        try:
+            self.ucs.vmem.save_state(config.ucs_save_path)
+            return f"✅ Saved {len(self.ucs.vmem.embeddings)} mementos to {config.ucs_save_path}"
+        except Exception as e:
+            return f"❌ Save failed: {e}"
+    
+    def clear_ucs_memory(self) -> str:
+        """Clear UCS memory (destructive!)"""
+        if not self.ucs_enabled or not self.ucs:
+            return "❌ UCS not enabled"
+        
+        try:
+            self.ucs._ensure_memory()  # Reinitialize empty memory
+            return f"✅ UCS memory cleared"
+        except Exception as e:
+            return f"❌ Clear failed: {e}"
+    
+    def shutdown(self):
+        """Graceful shutdown"""
+        logger.info("🛑 Shutting down...")
+        
+        # Save UCS memory
+        if self.ucs_enabled and self.ucs:
+            try:
+                logger.info("💾 Saving UCS memory before shutdown...")
+                self.ucs.vmem.save_state(config.ucs_save_path)
+                self.ucs.shutdown()
+            except Exception as e:
+                logger.error(f"UCS shutdown error: {e}")
+        
+        # Shutdown TTS
+        if self.tts_processor:
+            self.tts_processor.shutdown()
+        
+        logger.info("👋 Goodbye!")
 
-
-# Initialize chatbot globally
-chatbot = ChatBot()
-
+# Global initialization
+DEVICE, DEVICE_INFO, DEVICE_DETAILS = get_optimal_device_config()
+optimize_torch_settings(DEVICE, DEVICE_DETAILS.get('cpu_cores', multiprocessing.cpu_count()))
+chatbot = UCSEnhancedChatBot()
 
 def record_and_transcribe(audio_file_path):
-    """Transcribe the audio file and return the text"""
+    """Transcribe audio file"""
     if audio_file_path is None:
         return "No audio recorded."
     return chatbot.transcribe_voice_input(audio_file_path)
 
-
-def process_voice_to_chat(audio_file_path, history, enable_tts, voice_selection, speed_control):
-    """Transcribe audio and send it to chat"""
+async def process_voice_to_chat(audio_file_path, history, enable_tts, voice_selection, 
+                                speed_control, show_reasoning, use_ucs,
+                                system_prompt_val, temp_val, top_p_val, top_k_val, max_tokens_val):
+    """Transcribe and send to chat"""
     transcribed_text = record_and_transcribe(audio_file_path)
-    if transcribed_text and transcribed_text != "No audio recorded." and not transcribed_text.startswith("❌"):
-        # Use the maximum speed chat_response
-        return chatbot.chat_response_ludicrous_speed(transcribed_text, history, enable_tts, voice_selection, speed_control)
+    if transcribed_text and not transcribed_text.startswith("❌") and transcribed_text != "No audio recorded.":
+        return await chatbot.chat_response_parallel(
+            transcribed_text, history, enable_tts, voice_selection, 
+            speed_control, show_reasoning, use_ucs,
+            temp_val, top_p_val, int(top_k_val), int(max_tokens_val), system_prompt_val
+        )
     else:
         return history, "", None
 
-
 def shutdown_server():
-    """Shutdown the Gradio server"""
-    print("🛑 Shutdown requested by user...")
-    print("💭 Closing server in 2 seconds...")
+    """Shutdown server"""
+    logger.info("🛑 Shutdown requested...")
+    chatbot.shutdown()
 
     def delayed_shutdown():
         time.sleep(2)
         os._exit(0)
 
     threading.Thread(target=delayed_shutdown).start()
-    return "🛑 Server shutting down..."
-
+    return "🛑 Shutting down..."
 
 def create_gradio_interface():
-    """Create the Gradio interface"""
+    """Create Gradio interface with UCS controls"""
 
-    # Available voices for Kokoro TTS
     available_voices = [
         "af", "af_bella", "af_heart", "af_sky", "af_wave", "af_happy", "af_happy_2", "af_confused",
         "am", "am_adam", "am_michael", "bf", "bf_emma", "bf_isabella", "bm", "bm_george", "bm_lewis"
     ]
 
-    # Custom CSS for better styling
     css = """
     .gradio-container {
         max-width: 1400px !important;
+        font-family: 'Inter', sans-serif;
     }
-    .chat-message {
-        padding: 10px;
-        margin: 5px 0;
-        border-radius: 10px;
+    .gradio-container .gr-button.primary {
+        background-color: #4CAF50;
+        color: white;
+        border-radius: 8px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    }
+    .gradio-container .gr-button.secondary {
+        background-color: #f0f0f0;
+        color: #333;
+        border-radius: 8px;
+    }
+    .gradio-container .gr-button.stop {
+        background-color: #f44336;
+        color: white;
+        border-radius: 8px;
+    }
+    .ucs-indicator {
+        color: #2196F3;
+        font-weight: bold;
     }
     """
 
-    with gr.Blocks(css=css, title="DialoGPT Chat with Voice I/O") as demo:
-        gr.Markdown("# 🧠 DialoGPT Chat with Voice Input/Output")
-        gr.Markdown("Enhanced chatbot with voice input (speech-to-text) and voice output (text-to-speech)")
+    with gr.Blocks(css=css, title="UCS-Enhanced Rhizome Chat") as demo:
+        gr.Markdown("# 🧠 UCS-Enhanced Rhizome Chat")
+        gr.Markdown("Reasoning model with cognitive architecture, vector memory, and expert systems")
 
         with gr.Row():
             with gr.Column(scale=3):
@@ -1064,43 +1296,127 @@ def create_gradio_interface():
                     show_label=True
                 )
 
-                # Text input row
                 with gr.Row():
                     user_input = gr.Textbox(
-                        placeholder="Type your message here or use voice input below...",
+                        placeholder="Ask me anything...",
                         label="Your Message",
                         lines=2,
                         scale=4
                     )
                     send_btn = gr.Button("Send 💬", scale=1, variant="primary")
 
-                # Voice input row
+                with gr.Row():
+                    show_reasoning_checkbox = gr.Checkbox(
+                        label="Show Reasoning 💭",
+                        value=config.show_reasoning,
+                        info="Display the model's thinking process"
+                    )
+                    use_ucs_checkbox = gr.Checkbox(
+                        label="Enable UCS 🧠",
+                        value=config.ucs_memory_enabled,
+                        info="Use cognitive architecture and memory retrieval"
+                    )
+
+                # Generation Parameters
+                with gr.Accordion("🎛️ Generation Parameters", open=False):
+                    with gr.Row():
+                        system_prompt_input = gr.Textbox(
+                            label="System Prompt",
+                            value="You are a helpful assistant engaged in natural conversation. Use any retrieved context naturally without explicitly mentioning it. Stay conversational, witty, and emotionally intelligent.",
+                            lines=3,
+                            placeholder="Enter custom system prompt...",
+                            info="Instructions that guide the model's behavior"
+                        )
+                    
+                    with gr.Row():
+                        system_prompt_presets = gr.Dropdown(
+                            choices=[
+                                "Default (Conversational)",
+                                "Technical Assistant",
+                                "Creative Writer",
+                                "Analytical Thinker",
+                                "Concise & Direct",
+                                "Socratic Teacher",
+                                "Custom"
+                            ],
+                            value="Default (Conversational)",
+                            label="System Prompt Presets",
+                            scale=3
+                        )
+                        apply_system_prompt_btn = gr.Button("Apply Preset", size="sm", scale=1)
+                    
+                    with gr.Row():
+                        temperature_slider = gr.Slider(
+                            minimum=0.1,
+                            maximum=2.0,
+                            value=0.8,
+                            step=0.05,
+                            label="Temperature",
+                            info="Higher = more creative, Lower = more focused"
+                        )
+                        top_p_slider = gr.Slider(
+                            minimum=0.1,
+                            maximum=1.0,
+                            value=0.95,
+                            step=0.05,
+                            label="Top P",
+                            info="Nucleus sampling threshold"
+                        )
+                    
+                    with gr.Row():
+                        top_k_slider = gr.Slider(
+                            minimum=1,
+                            maximum=100,
+                            value=50,
+                            step=1,
+                            label="Top K",
+                            info="Limits vocabulary to top K tokens"
+                        )
+                        max_tokens_slider = gr.Slider(
+                            minimum=128,
+                            maximum=2048,
+                            value=768,
+                            step=64,
+                            label="Max Tokens",
+                            info="Maximum response length"
+                        )
+                    
+                    with gr.Row():
+                        preset_buttons = gr.Radio(
+                            choices=["Balanced", "Creative", "Focused", "Custom"],
+                            value="Balanced",
+                            label="Generation Presets",
+                            info="Quick parameter presets"
+                        )
+                        reset_params_btn = gr.Button("↺ Reset to Preset", size="sm")
+
                 with gr.Row():
                     with gr.Column(scale=2):
                         audio_input = gr.Microphone(
                             label="🎙️ Voice Input",
-                            type="filepath"
+                            type="filepath",
+                            interactive=VOSK_AVAILABLE
                         )
                     with gr.Column(scale=2):
                         transcribe_btn = gr.Button(
-                            "🎤 Transcribe Voice → Text",
+                            "🎤 Transcribe",
                             variant="secondary",
-                            size="lg"
+                            interactive=VOSK_AVAILABLE
                         )
                         voice_to_chat_btn = gr.Button(
                             "🗣️ Voice → Chat",
                             variant="primary",
-                            size="lg"
+                            interactive=VOSK_AVAILABLE
                         )
 
                 with gr.Row():
                     enable_tts = gr.Checkbox(
-                        label="Enable Text-to-Speech 🔊",
+                        label="Enable TTS 🔊",
                         value=KOKORO_AVAILABLE,
                         interactive=KOKORO_AVAILABLE
                     )
                     clear_btn = gr.Button("Clear Chat 🗑️", variant="secondary")
-                    shutdown_btn = gr.Button("Shutdown Server 🛑", variant="stop")
+                    shutdown_btn = gr.Button("Shutdown 🛑", variant="stop")
 
             with gr.Column(scale=1):
                 gr.Markdown("### 🎵 Audio Output")
@@ -1115,8 +1431,7 @@ def create_gradio_interface():
                     voice_selection = gr.Dropdown(
                         choices=available_voices,
                         value="af_heart",
-                        label="Voice",
-                        info="Select voice for TTS"
+                        label="Voice"
                     )
 
                     speed_control = gr.Slider(
@@ -1124,61 +1439,164 @@ def create_gradio_interface():
                         maximum=2.0,
                         value=1.0,
                         step=0.1,
-                        label="Speech Speed",
-                        info="Adjust playback speed"
+                        label="Speed"
                     )
                 else:
                     voice_selection = gr.Dropdown(choices=["af_heart"], value="af_heart", visible=False)
                     speed_control = gr.Slider(minimum=0.5, maximum=2.0, value=1.0, visible=False)
 
-                gr.Markdown("### 📊 Statistics")
-                stats_display = gr.Markdown(chatbot.get_stats())
-                refresh_stats = gr.Button("Refresh Stats 📊", size="sm")
+                gr.Markdown("### 🧠 UCS Memory Control")
+                with gr.Row():
+                    save_memory_btn = gr.Button("💾 Save Memory", size="sm")
+                    clear_memory_btn = gr.Button("🗑️ Clear Memory", size="sm")
+                
+                memory_status = gr.Markdown("Ready")
 
+                gr.Markdown("### 📊 Statistics")
+                stats_display = gr.Markdown(chatbot.get_comprehensive_stats())
+                refresh_stats = gr.Button("Refresh Stats 📊", size="sm")
+                
                 gr.Markdown("### 🛑 Server Control")
-                shutdown_status = gr.Markdown("Server running normally")
+                shutdown_status = gr.Markdown("Server running")
 
                 gr.Markdown("### ℹ️ Information")
-                tts_status = "✅ Kokoro TTS Available" if KOKORO_AVAILABLE else "❌ Install: pip install kokoro>=0.9.4 soundfile"
+                tts_status = "✅ Kokoro TTS" if KOKORO_AVAILABLE else "❌ Install: pip install kokoro>=0.9.4"
+                vosk_status = "✅ Vosk STT" if VOSK_AVAILABLE else "❌ Install: pip install vosk"
+                ucs_status = "✅ UCS v3.4.1" if chatbot.ucs_enabled else "❌ Limited (NumPy required)"
+                
                 gr.Markdown(f"""
-**Model Status:**
-- Device: {DEVICE}
-- TTS: {tts_status}
-- Coherence: {'✅ Enabled' if USE_COHERENCE else '❌ Disabled'}
+**Model:** {config.base_dir}
+**Device:** {DEVICE_INFO}
+**TTS:** {tts_status}
+**STT:** {vosk_status}
+**UCS:** {ucs_status}
+
+**Features:**
+- 🧠 UCS v3.4.1 cognitive architecture
+- 💭 Chain-of-thought reasoning
+- 📚 Vector memory & retrieval
+- 👥 Multi-expert system
+- 🎯 Context-aware responses
+- 🎤 Voice input/output
+- 🎛️ Adjustable generation parameters
+- 📝 Customizable system prompts
+
+**System Prompt Presets:**
+- **Conversational**: Natural, friendly chat
+- **Technical**: Precise, detailed explanations
+- **Creative**: Vivid, imaginative writing
+- **Analytical**: Structured, logical reasoning
+- **Concise**: Brief, direct responses
+- **Socratic**: Teaching through questions
+
+**Generation Presets:**
+- **Balanced** (default): Reliable, coherent responses
+- **Creative**: More diverse and imaginative
+- **Focused**: Precise and on-topic
+- **Custom**: Manual parameter control
 
 **Tips:**
-- Shorter messages often work better
-- Enable TTS to hear responses
-- Try different voices and speeds
-- Check stats to monitor performance
+- Choose a system prompt preset to shape personality
+- Enable "Enable UCS" for memory-augmented responses
+- Ask about previous conversations - UCS remembers!
+- Enable "Show Reasoning" to see thought process
+- Try different presets for varied response styles
+- Custom system prompts allow full control
+- UCS auto-saves memory every 5 minutes
+- TTS now handles longer responses with line breaks
                 """)
 
         # Event handlers
-        def handle_chat(user_input, history, enable_tts, voice, speed):
-            # Use the ludicrous speed chat function
-            return chatbot.chat_response_ludicrous_speed(user_input, history, enable_tts, voice, speed)
+        async def handle_chat(user_input_text, history, enable_tts_val, voice_val, 
+                            speed_val, show_reasoning_val, use_ucs_val,
+                            system_prompt_val, temp_val, top_p_val, top_k_val, max_tokens_val):
+            return await chatbot.chat_response_parallel(
+                user_input_text, history, enable_tts_val, voice_val, 
+                speed_val, show_reasoning_val, use_ucs_val,
+                temp_val, top_p_val, int(top_k_val), int(max_tokens_val), system_prompt_val
+            )
+        
+        def apply_system_prompt_preset(preset_name):
+            """Apply system prompt presets"""
+            prompts = {
+                "Default (Conversational)": "You are a helpful assistant engaged in natural conversation. Use any retrieved context naturally without explicitly mentioning it. Stay conversational, witty, and emotionally intelligent.",
+                "Technical Assistant": "You are a technical expert who provides clear, accurate, and detailed explanations. Focus on precision, best practices, and thorough analysis. Use technical terminology appropriately and provide examples when helpful.",
+                "Creative Writer": "You are a creative writing assistant with a flair for vivid descriptions, engaging narratives, and imaginative storytelling. Help craft compelling content with rich language and strong emotional resonance.",
+                "Analytical Thinker": "You are an analytical assistant who breaks down complex problems systematically. Provide structured reasoning, consider multiple perspectives, and use logic-driven analysis. Show your thought process step-by-step.",
+                "Concise & Direct": "You are a concise assistant who gets straight to the point. Provide brief, clear, and actionable responses. Avoid unnecessary elaboration while maintaining accuracy.",
+                "Socratic Teacher": "You are a Socratic teacher who guides learning through thoughtful questions. Help users discover answers themselves by asking probing questions, encouraging critical thinking, and building understanding progressively.",
+                "Custom": ""
+            }
+            return prompts.get(preset_name, prompts["Default (Conversational)"])
+        
+        def apply_preset(preset_name):
+            """Apply generation parameter presets"""
+            presets = {
+                "Balanced": (0.8, 0.95, 50, 768),
+                "Creative": (0.95, 0.95, 60, 800),
+                "Focused": (0.7, 0.85, 40, 512),
+                "Custom": (0.8, 0.95, 50, 768)  # Default for custom
+            }
+            temp, top_p, top_k, max_tokens = presets.get(preset_name, presets["Balanced"])
+            return temp, top_p, top_k, max_tokens
 
         def handle_clear():
-            chatbot.clear_chat()
-            return [], chatbot.get_stats()
+            return chatbot.clear_chat(), chatbot.get_comprehensive_stats()
 
         def handle_stats_refresh():
-            return chatbot.get_stats()
+            return chatbot.get_comprehensive_stats()
 
         def handle_shutdown():
             return shutdown_server()
+        
+        def handle_save_memory():
+            return chatbot.save_ucs_memory()
+        
+        def handle_clear_memory():
+            result = chatbot.clear_ucs_memory()
+            return result, chatbot.get_comprehensive_stats()
 
         # Wire up events
         send_btn.click(
             fn=handle_chat,
-            inputs=[user_input, chatbot_interface, enable_tts, voice_selection, speed_control],
+            inputs=[user_input, chatbot_interface, enable_tts, voice_selection, 
+                   speed_control, show_reasoning_checkbox, use_ucs_checkbox,
+                   system_prompt_input, temperature_slider, top_p_slider, top_k_slider, max_tokens_slider],
             outputs=[chatbot_interface, user_input, audio_output]
         )
 
         user_input.submit(
             fn=handle_chat,
-            inputs=[user_input, chatbot_interface, enable_tts, voice_selection, speed_control],
+            inputs=[user_input, chatbot_interface, enable_tts, voice_selection, 
+                   speed_control, show_reasoning_checkbox, use_ucs_checkbox,
+                   system_prompt_input, temperature_slider, top_p_slider, top_k_slider, max_tokens_slider],
             outputs=[chatbot_interface, user_input, audio_output]
+        )
+        
+        # Preset button handler
+        preset_buttons.change(
+            fn=apply_preset,
+            inputs=[preset_buttons],
+            outputs=[temperature_slider, top_p_slider, top_k_slider, max_tokens_slider]
+        )
+        
+        reset_params_btn.click(
+            fn=apply_preset,
+            inputs=[preset_buttons],
+            outputs=[temperature_slider, top_p_slider, top_k_slider, max_tokens_slider]
+        )
+        
+        # System prompt preset handler
+        apply_system_prompt_btn.click(
+            fn=apply_system_prompt_preset,
+            inputs=[system_prompt_presets],
+            outputs=[system_prompt_input]
+        )
+        
+        system_prompt_presets.change(
+            fn=apply_system_prompt_preset,
+            inputs=[system_prompt_presets],
+            outputs=[system_prompt_input]
         )
         
         clear_btn.click(
@@ -1196,73 +1614,91 @@ def create_gradio_interface():
             outputs=[shutdown_status]
         )
 
-        # Wire up the transcribe button to the new record_and_transcribe function
         transcribe_btn.click(
             fn=record_and_transcribe,
             inputs=[audio_input],
             outputs=[user_input]
         )
 
-        # Wire up the voice_to_chat button to the new process_voice_to_chat function
         voice_to_chat_btn.click(
             fn=process_voice_to_chat,
-            inputs=[audio_input, chatbot_interface, enable_tts, voice_selection, speed_control],
+            inputs=[audio_input, chatbot_interface, enable_tts, voice_selection, 
+                   speed_control, show_reasoning_checkbox, use_ucs_checkbox,
+                   system_prompt_input, temperature_slider, top_p_slider, top_k_slider, max_tokens_slider],
             outputs=[chatbot_interface, user_input, audio_output]
+        )
+        
+        save_memory_btn.click(
+            fn=handle_save_memory,
+            outputs=[memory_status]
+        )
+        
+        clear_memory_btn.click(
+            fn=handle_clear_memory,
+            outputs=[memory_status, stats_display]
         )
 
     return demo
 
 def open_browser():
-    """Open the web browser to the Gradio interface after a short delay"""
-    time.sleep(2)  # Wait for server to start
-    webbrowser.open('http://localhost:7860')
-    print("🌐 Opened browser automatically")
+    """Open browser after delay"""
+    time.sleep(2)
+    webbrowser.open(f'http://localhost:{config.server_port}')
+    logger.info(f"🌐 Opened browser at http://localhost:{config.server_port}")
 
 def main():
-    """Main function to run the application"""
-    print("🚀 Starting DialoGPT Chat with Kokoro TTS...")
-
-    # Load models
+    """Main function"""
+    logger.info("🚀 Starting UCS-Enhanced Rhizome Chat Interface...")
+    
     if not chatbot.load_models():
-        print("❌ Failed to initialize. Please check your model path and dependencies.")
+        logger.error("❌ Failed to initialize. Check your model path.")
+        logger.error(f"   Make sure '{config.base_dir}' contains your model files or checkpoint folders.")
         return
 
-    # Create and launch interface
     demo = create_gradio_interface()
 
-    print("\n✅ Ready! Starting web interface...")
-    print("🌐 Access the chat at: http://localhost:7860")
+    logger.info("\n✅ Ready! Starting web interface...")
+    logger.info(f"🌐 Access at: http://localhost:{config.server_port}")
+    logger.info("🔓 Running in UNRESTRICTED mode - no content filtering")
+    
+    if chatbot.ucs_enabled:
+        logger.info("🧠 UCS v3.4.1 cognitive architecture enabled")
+        logger.info(f"   - Vector memory: {len(chatbot.ucs.vmem.embeddings) if chatbot.ucs.vmem else 0} mementos")
+        logger.info(f"   - Expert system: {len(chatbot.ucs.expert_manager.experts)} experts")
+        logger.info(f"   - Auto-save: Every {config.ucs_auto_save_interval}s")
+    else:
+        logger.info("⚠️ UCS disabled (requires NumPy + sentence-transformers)")
 
     if KOKORO_AVAILABLE:
-        print("🔊 Kokoro TTS is available and enabled")
-        print("🎙️ Available voices: af_heart, af_bella, bf_emma, bm_george, and more!")
-    else:
-        print("⚠️ Kokoro TTS not available")
-        print("📦 Install with: pip install kokoro>=0.9.4 soundfile")
-        print("🐧 On Ubuntu/Debian also run: apt-get install espeak-ng")
+        logger.info("🔊 Kokoro TTS enabled")
+    
+    if VOSK_AVAILABLE:
+        logger.info("🎤 Vosk STT enabled")
 
-    # Open browser automatically in a separate thread
-    browser_thread = threading.Thread(target=open_browser)
-    browser_thread.daemon = True
-    browser_thread.start()
+    if config.auto_open_browser:
+        browser_thread = threading.Thread(target=open_browser)
+        browser_thread.daemon = True
+        browser_thread.start()
 
     try:
         demo.launch(
-            server_name="127.0.0.1",  # Changed to localhost
-            server_port=7860,
+            server_name="127.0.0.1",
+            server_port=config.server_port,
             share=False,
             inbrowser=False,
-            show_error=False,  # Reduced error handling overhead
-            quiet=True, # Reduced logging
-            max_threads=1 # Limited concurrent requests
+            show_error=True,
+            quiet=False,
+            max_threads=1,
+            allowed_paths=['/tmp']
         )
     except KeyboardInterrupt:
-        print("\n🛑 Server stopped by user (Ctrl+C)")
+        logger.info("\n🛑 Stopped by user (Ctrl+C)")
     except Exception as e:
-        print(f"\n❌ Server error: {e}")
+        logger.error(f"\n❌ Server error: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
-        print("👋 Goodbye!")
+        chatbot.shutdown()
 
 if __name__ == "__main__":
     main()
-
