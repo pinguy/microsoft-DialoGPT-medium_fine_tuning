@@ -678,6 +678,11 @@ class DistributedExpertManager:
                 try:
                     import ray
                     os.environ["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
+                    # FIX: Add OOM prevention and metrics disabling based on logs
+                    os.environ["RAY_DISABLE_MEMORY_MONITOR"] = "1"
+                    os.environ["RAY_memory_monitor_refresh_ms"] = "0" # Disable worker killing
+                    os.environ["RAY_METRICS_AGENT_PORT"] = "0" # Disable metrics
+                    
                     ray.init(ignore_reinit_error=True)
                     global HAS_RAY
                     HAS_RAY = True
@@ -1334,7 +1339,8 @@ class VectorMemory:
         try:
             opener = gzip.open if HAS_GZIP_LOCAL and path.endswith(".gz") else open
             mode = 'rt' if path.endswith(".gz") else 'r'
-            with opener(path, mode, encoding='utf-8') as f:
+            # FIX: Add errors='replace' to handle potential UnicodeDecodeError
+            with opener(path, mode, encoding='utf-8', errors='replace') as f:
                 data = json.load(f)
             
             schema = data.get("schema", 0)
@@ -2663,7 +2669,7 @@ if __name__ == "__main__":
                 task_manager.shutdown()
         else:
             _logger.info("Minimal environment detected - running v3 lightweight smoke test")
-            _logger.info(f"Missing: HNSW={HAS_HNSWLIB}, API={_check_api_dependencies()}")
+            _logger.warning(f"Missing: HNSW={HAS_HNSWLIB}, API={_check_api_dependencies()}")
             try:
                 result = run_v3_smoke_test()
                 if result['status'] == 'success':
