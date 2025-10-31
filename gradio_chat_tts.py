@@ -79,7 +79,7 @@ class Config:
     ucs_memory_enabled: bool = True
     ucs_expert_system: bool = True
     ucs_embed_model: str = "all-MiniLM-L12-v2"  # Sentence transformer model
-    ucs_save_path: str = "rhizome_memory.json"
+    ucs_save_path: str = "rhizome_memory.json"  # Use JSON format for compatibility
     ucs_auto_save_interval: int = 300  # Save every 5 minutes
     ucs_fast_retrieval: bool = True  # Use fast direct retrieval instead of full cognitive loop
 
@@ -1054,10 +1054,6 @@ class UCSEnhancedChatBot:
                     audio_file = tts_future.result(timeout=10.0)  # Increased timeout for longer text
                 except Exception as tts_error:
                     logger.warning(f"TTS timeout or error: {tts_error}")
-            
-            # Memory cleanup
-            if self.performance_monitor.should_cleanup_memory():
-                self._cleanup_memory()
             
             duration = time.perf_counter() - start_time
             logger.info(f"⚡ Response in {duration:.2f}s ({method})")
