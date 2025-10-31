@@ -10,10 +10,10 @@
 # - pip3 install numpy hnswlib sentence-transformers fastapi uvicorn ray "passlib" "python-jose[cryptography]" bcrypt==3.2.2
 #
 # Smoke test (auto-detects best test for environment)
-# - python3 UCS_v3_4_1.py --mode smoke
+# - python3 UCS_v3.4.1.py --mode smoke
 #
 # API with real embeddings
-# - python3 UCS_v3_4_1.py --embed-model all-MiniLM-L12-v2 --api
+# - python3 UCS_v3.4.1.py --embed-model all-MiniLM-L12-v2 --api
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -293,12 +293,12 @@ class AdaptiveThreadPool:
                 if self.queue_depth > 10 and self.executor._max_workers < self.max_workers:
                     new_size = min(int(self.executor._max_workers * self.scale_factor),
                                    self.max_workers)
-                    _logger.info(f"Scaling thread pool: {self.executor._max_workers} → {new_size}")
+                    _logger.info(f"Scaling thread pool: {self.executor._max_workers} â†’ {new_size}")
                     self._resize_pool(new_size)
                 elif self.queue_depth < 2 and self.executor._max_workers > self.min_workers:
                     new_size = max(int(self.executor._max_workers / self.scale_factor),
                                    self.min_workers)
-                    _logger.info(f"Downscaling thread pool: {self.executor._max_workers} → {new_size}")
+                    _logger.info(f"Downscaling thread pool: {self.executor._max_workers} â†’ {new_size}")
                     self._resize_pool(new_size)
 
     def _resize_pool(self, new_size):
@@ -678,11 +678,6 @@ class DistributedExpertManager:
                 try:
                     import ray
                     os.environ["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
-                    # FIX: Add OOM prevention and metrics disabling based on logs
-                    os.environ["RAY_DISABLE_MEMORY_MONITOR"] = "1"
-                    os.environ["RAY_memory_monitor_refresh_ms"] = "0" # Disable worker killing
-                    os.environ["RAY_METRICS_AGENT_PORT"] = "0" # Disable metrics
-                    
                     ray.init(ignore_reinit_error=True)
                     global HAS_RAY
                     HAS_RAY = True
@@ -1339,8 +1334,7 @@ class VectorMemory:
         try:
             opener = gzip.open if HAS_GZIP_LOCAL and path.endswith(".gz") else open
             mode = 'rt' if path.endswith(".gz") else 'r'
-            # FIX: Add errors='replace' to handle potential UnicodeDecodeError
-            with opener(path, mode, encoding='utf-8', errors='replace') as f:
+            with opener(path, mode, encoding='utf-8') as f:
                 data = json.load(f)
             
             schema = data.get("schema", 0)
@@ -2009,7 +2003,7 @@ def run_v3_smoke_test():
     """Lightweight v3 smoke test that works in minimal environments - ports successful v3.py logic."""
     if not HAS_NUMPY:
         _logger.warning("NumPy not found. Skipping v3 smoke test.")
-        print("✗ V3 smoke test skipped - NumPy required")
+        print("âœ— V3 smoke test skipped - NumPy required")
         return {"status": "skipped", "reason": "numpy_missing"}
     
     _logger.info("--- Running Enhanced UCS v3 Smoke Test ---")
@@ -2203,7 +2197,7 @@ def run_v3_4_smoke_test():
     """Full v3.4 smoke test with all advanced features."""
     if not HAS_NUMPY:
         _logger.warning("NumPy not found. Skipping v3.4 smoke test.")
-        print("✗ V3.4 smoke test skipped - NumPy required")
+        print("âœ— V3.4 smoke test skipped - NumPy required")
         return {"status": "skipped", "reason": "numpy_missing"}
 
     _logger.info("--- Running Enhanced UCS v3.4 Smoke Test ---")
@@ -2367,7 +2361,7 @@ def run_v3_4_smoke_test():
         _logger.info("Shutdown complete")
 
         _logger.info("Enhanced UCS v3.4 smoke test completed successfully!")
-        print("✓ V3.4 Smoke Test OK")
+        print("âœ“ V3.4 Smoke Test OK")
 
         return {
             "status": "success",
@@ -2655,13 +2649,13 @@ if __name__ == "__main__":
             try:
                 result = run_v3_4_smoke_test()
                 if result['status'] == 'success':
-                    print(f"\n✓ UCS v3.4 Full Stack OK - All {len(result.get('components_tested', []))} components passed")
+                    print(f"\nâœ“ UCS v3.4 Full Stack OK - All {len(result.get('components_tested', []))} components passed")
                     sys.exit(0)
                 else:
-                    print(f"\n✗ UCS v3.4 FAILED - {result.get('error', 'Unknown error')}")
+                    print(f"\nâœ— UCS v3.4 FAILED - {result.get('error', 'Unknown error')}")
                     sys.exit(1)
             except Exception as e:
-                print(f"\n✗ V3.4 smoke test failed: {e}")
+                print(f"\nâœ— V3.4 smoke test failed: {e}")
                 import traceback
                 traceback.print_exc()
                 sys.exit(1)
@@ -2669,17 +2663,17 @@ if __name__ == "__main__":
                 task_manager.shutdown()
         else:
             _logger.info("Minimal environment detected - running v3 lightweight smoke test")
-            _logger.warning(f"Missing: HNSW={HAS_HNSWLIB}, API={_check_api_dependencies()}")
+            _logger.info(f"Missing: HNSW={HAS_HNSWLIB}, API={_check_api_dependencies()}")
             try:
                 result = run_v3_smoke_test()
                 if result['status'] == 'success':
-                    print(f"\n✓ UCS v3 Lightweight OK - {result.get('mementos_created', 0)} mementos tested")
+                    print(f"\nâœ“ UCS v3 Lightweight OK - {result.get('mementos_created', 0)} mementos tested")
                     sys.exit(0)
                 else:
-                    print(f"\n✗ UCS v3 FAILED - {result.get('error', 'Unknown error')}")
+                    print(f"\nâœ— UCS v3 FAILED - {result.get('error', 'Unknown error')}")
                     sys.exit(1)
             except Exception as e:
-                print(f"\n✗ V3 smoke test failed: {e}")
+                print(f"\nâœ— V3 smoke test failed: {e}")
                 import traceback
                 traceback.print_exc()
                 sys.exit(1)
@@ -2716,13 +2710,13 @@ if __name__ == "__main__":
         try:
             result = run_v3_4_smoke_test()
             if result['status'] == 'success':
-                print(f"\n✓ UCS v3.4 OK - All tests passed")
+                print(f"\nâœ“ UCS v3.4 OK - All tests passed")
                 sys.exit(0)
             else:
-                print(f"\n✗ UCS v3.4 FAILED - {result.get('error', 'Unknown error')}")
+                print(f"\nâœ— UCS v3.4 FAILED - {result.get('error', 'Unknown error')}")
                 sys.exit(1)
         except Exception as e:
-            print(f"\n✗ Smoke test failed: {e}")
+            print(f"\nâœ— Smoke test failed: {e}")
             import traceback
             traceback.print_exc()
             sys.exit(1)
