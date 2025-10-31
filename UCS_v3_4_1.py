@@ -10,10 +10,10 @@
 # - pip3 install numpy hnswlib sentence-transformers fastapi uvicorn ray "passlib" "python-jose[cryptography]" bcrypt==3.2.2
 #
 # Smoke test (auto-detects best test for environment)
-# - python3 UCS_v3.4.1.py --mode smoke
+# - python3 UCS_v3_4_1.py --mode smoke
 #
 # API with real embeddings
-# - python3 UCS_v3.4.1.py --embed-model all-MiniLM-L12-v2 --api
+# - python3 UCS_v3_4_1.py --embed-model all-MiniLM-L12-v2 --api
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
