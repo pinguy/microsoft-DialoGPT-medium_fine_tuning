@@ -714,7 +714,7 @@ class UCSEnhancedChatBot:
             _ = self.model.generate(
                 **inputs,
                 max_new_tokens=10,
-                do_sample=False,
+                do_sample=True,
                 pad_token_id=self.tokenizer.pad_token_id
             )
         
