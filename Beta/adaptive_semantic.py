@@ -17,25 +17,24 @@ Key improvements:
 - IPF ENHANCEMENT: --semantic-method [tfidf|ipf|hybrid|llm]
 
 # Required for IPF functionality
-pip install pyipf
+pip install ipfn
 
 # Other requirements
 pip install sentence-transformers sklearn ftfy pdfminer.six numpy tqdm torch
 
 Usage:
   # Normal mode with TF-IDF (default, stateless heuristics)
-  python ipf_semantic.py --pdf-dir ./PDFs --enable-semantic-labeling
+  python3 adaptive_semantic.py --pdf-dir ./PDFs --enable-semantic-labeling
 
-  python3 ipf_semantic.py --pdf-dir ./PDFs --force-cpu --enable-semantic-labeling --semantic-mode normal --semantic-method hybrid --no-save-intermediates
+  python3 adaptive_semantic.py --pdf-dir ./PDFs --force-cpu --enable-semantic-labeling --semantic-mode normal --semantic-method hybrid
   
   # Adaptive mode with IPF enhancement (learns from previous runs)
-  python ipf_semantic.py --pdf-dir ./PDFs --enable-semantic-labeling --semantic-mode adaptive --semantic-method ipf
+  python3 adaptive_semantic.py --pdf-dir ./PDFs --enable-semantic-labeling --semantic-mode adaptive --semantic-method ipf
   
   # Hybrid mode (IPF + TF-IDF)
-  python ipf_semantic.py --pdf-dir ./PDFs --enable-semantic-labeling --semantic-mode adaptive --semantic-method hybrid
+  python3 adaptive_semantic.py --pdf-dir ./PDFs --enable-semantic-labeling --semantic-mode adaptive --semantic-method hybrid
 
-python3 adaptive_semantic.py --pdf-dir ./PDFs --force-cpu --enable-semantic-labeling --semantic-mode normal --semantic-method hybrid --no-save-intermediates
-
+python3 adaptive_semantic.py --pdf-dir ./PDFs --force-cpu --enable-semantic-labeling --semantic-mode normal --semantic-method hybrid --qa-max-pairs-per-source 10000 --no-save-intermediates
 """
 
 from __future__ import annotations
@@ -2497,4 +2496,3 @@ Performance tips:
 
 if __name__ == '__main__':
     cli()
-
