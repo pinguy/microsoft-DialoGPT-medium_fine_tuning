@@ -2748,7 +2748,7 @@ Performance tips:
     # Chunking
     p.add_argument('--chunk-size', type=int, default=500,
                    help='Words per chunk (or max words for semantic chunking)')
-    p.add_argument('--chunk-overlap', type=int, default=50,
+    p.add_argument('--chunk-overlap', type=int, default=100,
                    help='Word overlap for fixed-word chunking')
     p.add_argument('--chunking-method', choices=['fixed', 'sentence', 'texttile'],
                    default='fixed',
