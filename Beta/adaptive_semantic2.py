@@ -247,7 +247,7 @@ class Config:
     
     # Chunking
     chunk_size: int = 500
-    chunk_overlap: int = 50
+    chunk_overlap: int = 100
     chunking_method: str = 'fixed' # Replaced use_semantic_chunking
     min_text_length: int = 20
     max_text_length: int = 10000
