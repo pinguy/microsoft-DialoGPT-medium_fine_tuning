@@ -63,6 +63,10 @@ import logging
 import argparse
 import hashlib
 import pickle
+import multiprocessing
+import time
+from functools import partial
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Set
 from collections import defaultdict, Counter
@@ -80,6 +84,33 @@ import torch
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
+
+# --- NLTK Setup ---
+NLTK_AVAILABLE = False
+try:
+    import nltk
+    from nltk.data import find
+    # Attempt to verify or download the required resource
+    try:
+        find('tokenizers/punkt_tab')
+        print("NLTK resource 'punkt_tab' found.")
+    except LookupError:
+        print("NLTK resource 'punkt_tab' not found. Attempting automatic download...")
+        try:
+            # Download the required resource silently
+            nltk.download('punkt_tab', quiet=True)
+            find('tokenizers/punkt_tab') # Re-check if download worked
+            print("NLTK resource 'punkt_tab' downloaded successfully.")
+        except Exception as e:
+            # Fallback if download still fails (due to zip error, network, permissions, etc.)
+            print(f"ERROR: Automatic NLTK download failed. Details: {e}")
+            print("Please run 'import nltk; nltk.download(\"punkt_tab\")' manually in a Python console.")
+            # Set to False as we can't guarantee function
+            # Note: We still set NLTK_AVAILABLE=True below if import worked, allowing degraded function.
+
+    NLTK_AVAILABLE = True
+except ImportError:
+    pass
 
 # Optional deps
 try:
