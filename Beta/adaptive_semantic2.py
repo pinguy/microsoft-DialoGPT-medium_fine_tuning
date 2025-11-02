@@ -14,7 +14,7 @@ Key improvements:
 - GPU auto-detection for embeddings with --force-cpu flag
 - CLI flags for --no-qa and --debug logging
 - ADAPTIVE SEMANTIC LEARNING: --semantic-mode [normal|adaptive]
-- IPF ENHANCEMENT: --semantic-method [tfidf|ipf|hybrid|llm]
+- IPF ENHANCEMENT: --semantic-method [tfidf|ipf|hybrid]
 
 # Required for IPF functionality
 pip3 install pyipf
@@ -265,8 +265,7 @@ class Config:
     extract_keyphrases: bool = False
     semantic_mode: str = 'normal'  # 'normal' or 'adaptive'
     semantic_memory_path: str = 'semantic_memory.pkl'
-    semantic_method: str = 'tfidf'  # 'tfidf', 'ipf', 'hybrid', 'llm'
-    semantic_model: str = 'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B'
+    semantic_method: str = 'tfidf'  # 'tfidf', 'ipf', 'hybrid'
     max_themes_per_chunk: int = 3
     
     # IPF-specific
@@ -1230,7 +1229,6 @@ class SemanticLabeler:
     - tfidf: Fast TF-IDF based extraction (default)
     - ipf: IPF-enhanced adaptive learning
     - hybrid: TF-IDF + IPF combination
-    - llm: LLM-based labeling (placeholder)
     - keybert: KeyBERT-based conceptual extraction
     """
     
@@ -1411,167 +1409,24 @@ class SemanticLabeler:
         if not themes:
             themes = [self._classify_content_type(text)]
         
-        # Record for learning
+        # Track this run
         self._current_run_themes.append(themes)
-        self._current_run_records.append({'text': text, 'themes': themes})
+        self._current_run_records.append({
+            'text': text,
+            'themes': themes
+        })
         
-        # Track discovery
-        for t in themes:
-            self.discovered[t] += 1
-            
-        method = 'keybert' if self.cfg.extract_keyphrases and self.kw_model else self.method
+        # Compute confidence
+        confidence = self._compute_confidence(themes, text)
         
         return {
             'themes': themes,
             'primary_theme': themes[0] if themes else 'general_content',
-            'confidence': self._compute_confidence(themes, text),
-            'method': f'adaptive_{method}',
+            'confidence': confidence,
+            'method': f'adaptive_{self.method}',
             'generation': self.memory.generation,
-            'ipf_generation': self.memory.ipf_generation
+            'ipf_generation': self.memory.ipf_generation if self.method in ['ipf', 'hybrid'] else 0
         }
-    
-    # ========================================================================
-    # Extraction Methods
-    # ========================================================================
-    
-    def _extract_keyphrases(self, text: str) -> List[str]:
-        """Extract meaningful keyphrases, not just names, using KeyBERT"""
-        if not self.kw_model:
-            return []
-        
-        try:
-            # Extract top keyphrases with diversity
-            keywords = self.kw_model.extract_keywords(
-                text,
-                keyphrase_ngram_range=(1, 3),
-                stop_words='english',
-                use_maxsum=True,
-                nr_candidates=20,
-                top_n=10,
-                diversity=0.7  # Enforce diversity
-            )
-            
-            # Filter out pure proper names
-            themes = []
-            for phrase, score in keywords:
-                # Skip if all words are capitalized (likely a name)
-                words = phrase.split()
-                if not all(w[0].isupper() for w in words if w):
-                    themes.append(phrase)
-            
-            return themes
-        except Exception as e:
-            logger.warning(f"KeyBERT extraction failed: {e}")
-            return []
-    
-    def _extract_hierarchical_themes(self, text: str) -> List[str]:
-        """Extract both specific and general themes"""
-        themes = []
-        
-        # Named entities
-        themes.extend(re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', text))
-        
-        # Conceptual phrases (noun + theory/analysis/study/technique)
-        concept_patterns = [
-            r'\b(\w+\s+(?:theory|analysis|framework|model|approach))\b',
-            r'\b(\w+\s+(?:technique|method|strategy|principle))\b',
-        ]
-        for pattern in concept_patterns:
-            themes.extend(re.findall(pattern, text.lower()))
-        
-        # Topic areas (look for field-specific vocabulary)
-        topic_keywords = {
-            'psychology': ['cognitive', 'behavioral', 'emotional', 'perception'],
-            'linguistics': ['semantic', 'syntax', 'pragmatic', 'discourse'],
-            'sociology': ['social', 'cultural', 'interaction', 'group'],
-            'comedy': ['humor', 'joke', 'timing', 'punchline', 'setup'],
-        }
-        for topic, keywords in topic_keywords.items():
-            if any(kw in text.lower() for kw in keywords):
-                themes.append(topic)
-        
-        # Add older heuristics as a final fallback
-        themes.extend(self._extract_technical_terms(text)[:3])
-        themes.extend(self._extract_sentence_subjects(text)[:3])
-        
-        return themes
-    
-    def _extract_tfidf_themes(self, text: str) -> List[str]:
-        """Extract themes using TF-IDF"""
-        if not self._tfidf_fitted and len(self._tfidf_corpus) >= 10:
-            try:
-                self.tfidf.fit(self._tfidf_corpus)
-                self._tfidf_fitted = True
-                logger.debug(f"TF-IDF fitted on {len(self._tfidf_corpus)} documents")
-            except:
-                pass
-        
-        if not self._tfidf_fitted:
-            # Fallback to heuristics if not enough data
-            return self._extract_hierarchical_themes(text)
-        
-        try:
-            tfidf_matrix = self.tfidf.transform([text])
-            feature_names = self.tfidf.get_feature_names_out()
-            
-            # Get top TF-IDF scored terms
-            scores = tfidf_matrix.toarray()[0]
-            top_indices = scores.argsort()[-10:][::-1]
-            
-            themes = [feature_names[i] for i in top_indices if scores[i] > 0]
-            return themes[:5]
-        except:
-            return self._extract_hierarchical_themes(text)
-    
-    def _extract_technical_terms(self, text: str) -> List[str]:
-        """Extract technical patterns"""
-        patterns = [
-            r'\b([a-z]+(?:_[a-z]+)+)\b',
-            r'\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b',
-            r'\b(\w+(?:-\w+){1,2})\b',
-        ]
-        terms = []
-        for pattern in patterns:
-            terms.extend(re.findall(pattern, text))
-        return terms
-    
-    def _extract_sentence_subjects(self, text: str) -> List[str]:
-        """Extract subjects from sentences"""
-        return re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:is|are|was|were)\b', text)
-
-    def _classify_content_type(self, text: str) -> str:
-        """Fallback content classification"""
-        if len(re.findall(r'\d+', text)) > 5:
-            return 'quantitative_analysis'
-        elif any(w in text.lower() for w in ['function', 'algorithm', 'code']):
-            return 'computational_content'
-        elif any(w in text.lower() for w in ['study', 'research', 'experiment']):
-            return 'research_content'
-        return 'descriptive_content'
-    
-    def _normalize(self, s: str) -> str:
-        """Normalize to snake_case and filter stopwords"""
-        s = re.sub(r'["\'{}\(\)\[\]]', '', s)
-        s = re.sub(r'[\s\-]+', '_', s.lower())
-        s = re.sub(r'[^a-z0-9_]', '', s)
-        s = re.sub(r'_+', '_', s).strip('_')
-        
-        parts = s.split('_')
-        filtered = [p for p in parts if p and p not in self.STOPWORDS and len(p) > 2]
-        
-        if not filtered:
-            return ''
-        
-        result = '_'.join(filtered)
-        
-        if len(result) < 3 or result.isdigit():
-            return ''
-        
-        return result
-    
-    # ========================================================================
-    # Adaptive Mode Methods
-    # ========================================================================
     
     def _apply_coherence_weights(self, candidates: Set[str], text: str) -> List[Tuple[str, float]]:
         """Apply learned coherence weights to boost related themes"""
@@ -1658,6 +1513,126 @@ class SemanticLabeler:
                 base += 0.05 * min(mi_pairs_found, 3)
         
         return min(base, 0.95)
+    
+    # ========================================================================
+    # Theme Extraction Methods
+    # ========================================================================
+    
+    def _extract_keyphrases(self, text: str) -> Set[str]:
+        """Extract keyphrases using KeyBERT"""
+        if not self.kw_model:
+            return set()
+        
+        try:
+            # Extract top keyphrases
+            keywords = self.kw_model.extract_keywords(
+                text[:1000],  # Limit text length for performance
+                keyphrase_ngram_range=(1, 3),
+                stop_words='english',
+                top_n=10,
+                use_maxsum=True,
+                nr_candidates=20,
+                diversity=0.7
+            )
+            
+            # Filter and return
+            phrases = set()
+            for phrase, score in keywords:
+                if score > 0.3:  # Confidence threshold
+                    phrases.add(phrase.lower())
+            
+            return phrases
+        except Exception as e:
+            logger.debug(f"KeyBERT extraction failed: {e}")
+            return set()
+    
+    def _extract_tfidf_themes(self, text: str) -> Set[str]:
+        """Extract themes using TF-IDF"""
+        if not self._tfidf_fitted and len(self._tfidf_corpus) >= 2:
+            try:
+                self.tfidf.fit(self._tfidf_corpus)
+                self._tfidf_fitted = True
+            except:
+                pass
+        
+        if not self._tfidf_fitted:
+            return set()
+        
+        try:
+            vec = self.tfidf.transform([text])
+            feature_names = self.tfidf.get_feature_names_out()
+            
+            # Get top features
+            scores = vec.toarray()[0]
+            top_indices = scores.argsort()[-10:][::-1]
+            
+            themes = set()
+            for idx in top_indices:
+                if scores[idx] > 0:
+                    theme = feature_names[idx]
+                    if theme.lower() not in self.STOPWORDS:
+                        themes.add(theme)
+            
+            return themes
+        except:
+            return set()
+    
+    def _extract_hierarchical_themes(self, text: str) -> Set[str]:
+        """Extract themes using hierarchical patterns"""
+        themes = set()
+        
+        # Capitalized phrases (potential proper nouns)
+        cap_phrases = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\b', text)
+        themes.update(cap_phrases[:5])
+        
+        # Technical terms (words with numbers/special chars)
+        tech_terms = re.findall(r'\b[A-Za-z]+[-_][A-Za-z0-9]+\b', text)
+        themes.update(tech_terms[:3])
+        
+        # Quoted terms
+        quoted = re.findall(r'"([^"]{3,30})"', text)
+        themes.update(quoted[:3])
+        
+        return themes
+    
+    def _classify_content_type(self, text: str) -> str:
+        """Classify general content type as fallback"""
+        text_lower = text.lower()
+        
+        # Check for common patterns
+        if any(word in text_lower for word in ['study', 'research', 'experiment', 'hypothesis']):
+            return 'research_content'
+        elif any(word in text_lower for word in ['section', 'chapter', 'introduction', 'conclusion']):
+            return 'structured_document'
+        elif any(word in text_lower for word in ['figure', 'table', 'chart', 'diagram']):
+            return 'visual_reference'
+        elif any(word in text_lower for word in ['therefore', 'however', 'moreover', 'furthermore']):
+            return 'analytical_text'
+        elif len(re.findall(r'\d+', text)) / max(len(text.split()), 1) > 0.1:
+            return 'data_content'
+        else:
+            return 'general_content'
+    
+    def _normalize(self, theme: str) -> str:
+        """Normalize theme string"""
+        if not theme:
+            return ''
+        
+        # Convert to lowercase
+        theme = theme.lower().strip()
+        
+        # Remove punctuation except hyphens and underscores
+        theme = re.sub(r'[^\w\s-]', '', theme)
+        
+        # Replace spaces with underscores
+        theme = re.sub(r'\s+', '_', theme)
+        
+        # Remove stopwords
+        words = theme.split('_')
+        words = [w for w in words if w not in self.STOPWORDS]
+        theme = '_'.join(words)
+        
+        return theme
     
     # ========================================================================
     # Learning Phase (Adaptive Mode Only)
@@ -2113,10 +2088,11 @@ class KnowledgeBuilder:
                 # Fallback: just use the chunks as-is for this source
                 for i, ch in enumerate(arr):
                     grouped.append(ch)
-                    # We need an embedding. Re-embed this single chunk?
-                    # This shouldn't happen if build() logic is correct.
-                    # Let's check the build logic.
-                continue # Skip this source
+                    try:
+                        g_emb.append(embeddings[idxs[i]])
+                    except:
+                        pass
+                continue
             
             i = 0
             while i < len(arr):
@@ -2546,7 +2522,7 @@ def run(cfg: Config):
         kb.labeler.print_semantic_summary()
 
 # ============================================================================
-# DIAGNOSTIC UTILITIES
+# MAIN DIAGNOSTIC UTILITIES
 # ============================================================================
 
 def test_single_pdf(pdf_path: str):
@@ -2638,7 +2614,7 @@ def test_single_pdf(pdf_path: str):
     logger.info("=" * 70)
 
 # ============================================================================
-# CLI
+# MAIN CLI
 # ============================================================================
 
 def cli():
@@ -2660,7 +2636,7 @@ Examples:
   # Adaptive mode with IPF enhancement (learns from previous runs)
   python adaptive_semantic2.py --pdf-dir ./PDFs --enable-semantic-labeling --semantic-mode adaptive --semantic-method ipf
   
-  # Hybrid mode (TF-IDF + IPF combination)
+  # Hybrid mode (IPF + TF-IDF)
   python adaptive_semantic2.py --pdf-dir ./PDFs --enable-semantic-labeling --semantic-mode adaptive --semantic-method hybrid
   
   # Run on CPU even if GPU is available
@@ -2678,11 +2654,11 @@ Examples:
     --no-sections --chunk-size 300
   
   # Maximum quality with hybrid IPF+TF-IDF
-    p.add_argument('--pdf-dir ./PDFs --workers 16 \\
+  python adaptive_semantic2.py --pdf-dir ./PDFs --workers 16 \\
     --enable-ocr --enable-semantic-labeling --semantic-mode adaptive --semantic-method hybrid \\
     --chunk-size 400 --qa-max-pairs-per-source 10000
     
-  # NEW: Recommended Configuration for Flat PDFs
+  # NEW: Recommended Configuration for Flat PDFs (with emphasis on keyphrases)
   python3 adaptive_semantic2.py \\
     --pdf-dir ./PDFs \\
     --enable-semantic-labeling \\
@@ -2699,14 +2675,13 @@ Semantic Methods:
   - tfidf: Fast TF-IDF based theme extraction (default)
   - ipf: IPF-enhanced adaptive learning (requires: pip install pyipf)
   - hybrid: Combines TF-IDF + IPF for best results
-  - llm: LLM-based labeling (placeholder, not implemented)
 
 Semantic Modes:
   - normal: Fast heuristic-based labeling (stateless)
   - adaptive: Self-bootstrapping semantic learning (learns from previous runs)
     * Generation 0: Uses heuristics or TF-IDF
     * Generation 1+: Applies learned co-occurrence patterns and coherence weights
-    * Generation 3+ (with IPF): Stable concept hierarchies, calibrated co-occurrence, and MI matching
+    * Generation 3+ (with IPF): Applies stable concept hierarchies, calibrated co-occurrence, and MI matching
 
 IPF Features (when using --semantic-method ipf or hybrid):
   - Co-occurrence matrix calibration (removes noise)
@@ -2722,6 +2697,7 @@ Performance tips:
   - Adaptive mode builds a semantic memory file that improves over multiple runs
   - IPF requires 'pyipf' package: pip install pyipf
   - NLTK and KeyBERT improve quality but add overhead: pip install nltk keybert
+  - For keyphrase extraction, --extract-keyphrases leverages KeyBERT with the embedding model for conceptual themes without LLM overhead
         """
     )
     
@@ -2771,14 +2747,11 @@ Performance tips:
     p.add_argument('--semantic-mode', choices=['normal', 'adaptive'],
                    default='normal',
                    help='Semantic labeling mode: normal (stateless) or adaptive (self-learning)')
-    p.add_argument('--semantic-method', choices=['tfidf', 'ipf', 'hybrid', 'llm'],
+    p.add_argument('--semantic-method', choices=['tfidf', 'ipf', 'hybrid'],
                    default='tfidf',
-                   help='Semantic labeling method: tfidf (default), ipf (requires pyipf), hybrid (tfidf+ipf), llm (not implemented)')
+                   help='Semantic labeling method: tfidf (default), ipf (requires pyipf), hybrid (tfidf+ipf)')
     p.add_argument('--semantic-memory-path', default='semantic_memory.pkl',
                    help='Path to semantic memory file (adaptive mode only)')
-    p.add_argument('--semantic-model', 
-                   default='deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B',
-                   help='LLM model for semantic labeling (llm method only, not implemented)')
     
     # IPF-specific options
     p.add_argument('--ipf-convergence-rate', type=float, default=0.01,
@@ -2878,7 +2851,6 @@ Performance tips:
         semantic_mode=args.semantic_mode,
         semantic_method=args.semantic_method,
         semantic_memory_path=args.semantic_memory_path,
-        semantic_model=args.semantic_model,
         ipf_convergence_rate=args.ipf_convergence_rate,
         ipf_max_iterations=args.ipf_max_iterations,
         ipf_calibrate_cooccurrence=not args.no_ipf_calibrate,
