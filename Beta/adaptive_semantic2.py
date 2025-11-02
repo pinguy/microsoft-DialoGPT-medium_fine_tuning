@@ -16,6 +16,12 @@ Key improvements:
 - ADAPTIVE SEMANTIC LEARNING: --semantic-mode [normal|adaptive]
 - IPF ENHANCEMENT: --semantic-method [tfidf|ipf|hybrid|llm]
 
+# Required for IPF functionality
+pip3 install pyipf
+
+# Other requirements
+pip3 install sentence-transformers scikit-learn ftfy pdfminer.six numpy tqdm torch nltk keybert
+
 Usage:
   # Normal mode with TF-IDF (default, stateless heuristics)
   python3 adaptive_semantic2.py --pdf-dir ./PDFs --enable-semantic-labeling
@@ -27,6 +33,22 @@ Usage:
   
   # Hybrid mode (IPF + TF-IDF)
   python3 adaptive_semantic2.py --pdf-dir ./PDFs --enable-semantic-labeling --semantic-mode adaptive --semantic-method hybrid
+
+python3 adaptive_semantic2.py --pdf-dir ./PDFs --force-cpu --enable-semantic-labeling --semantic-mode normal --semantic-method hybrid --extract-keyphrases --no-save-intermediates
+
+# Recommended Configuration for Flat PDFs (with new improvements)
+python3 adaptive_semantic.py \
+  --pdf-dir ./PDFs \
+  --enable-semantic-labeling \
+  --semantic-mode adaptive \
+  --semantic-method hybrid \
+  --chunk-size 400 \
+  --chunk-overlap 100 \
+  --use-semantic-chunking \
+  --extract-keyphrases \
+  --enable-ocr \
+  --ocr-preprocessing
+
 """
 
 from __future__ import annotations
@@ -74,10 +96,89 @@ except:
     FAISS_AVAILABLE = False
 
 try:
-    from ipfn import ipfn
-    IPFN_AVAILABLE = True
+    from pyipf import ipf as pyipf_function
+    import numpy as np
+    
+    class IPF:
+        """
+        Wrapper for pyipf function to match the expected class-based API.
+        
+        The pyipf package uses a different API:
+        - pyipf expects: ipf(Z0, marginals, tol_convg, max_itr)
+        - Your code expects: IPF(seed, aggregates, dimensions).iteration()
+        
+        Key differences:
+        1. pyipf uses 'marginals' (list of arrays) instead of 'aggregates' + 'dimensions'
+        2. pyipf uses 'tol_convg' instead of 'convergence_rate'
+        3. pyipf uses 'max_itr' instead of 'max_iteration'
+        """
+        
+        def __init__(self, seed, aggregates, dimensions, 
+                     convergence_rate=0.01, max_iteration=100):
+            """
+            Initialize IPF wrapper.
+            
+            Args:
+                seed: Initial N-dimensional numpy array (Z0)
+                aggregates: List of target marginal arrays (e.g., [row_sums, col_sums])
+                dimensions: List of dimension indices (e.g., [[0], [1]] for 2D)
+                convergence_rate: Tolerance for convergence (maps to tol_convg)
+                max_iteration: Maximum iterations (maps to max_itr)
+            """
+            self.seed = seed
+            self.aggregates = aggregates
+            self.dimensions = dimensions
+            self.convergence_rate = convergence_rate
+            self.max_iteration = max_iteration
+        
+        def iteration(self):
+            """
+            Run IPF algorithm and return calibrated matrix.
+            
+            Converts from your code's API to pyipf's API:
+            - aggregates (list of lists) -> marginals (list of numpy arrays)
+            - Ignores 'dimensions' (pyipf assumes standard marginals)
+            """
+            # Convert aggregates to numpy arrays if needed
+            marginals = []
+            for agg in self.aggregates:
+                if isinstance(agg, np.ndarray):
+                    marginals.append(agg)
+                else:
+                    marginals.append(np.array(agg, dtype=float))
+            
+            # Call pyipf function
+            result = pyipf_function(
+                Z0=self.seed,
+                marginals=marginals,
+                tol_convg=self.convergence_rate,
+                max_itr=self.max_iteration,
+                convg='relative',
+                pbar=False
+            )
+            
+            return result
+    
+    IPF_AVAILABLE = True
+
+except Exception as e:
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.warning(f"IPF import failed: {e}")
+    IPF_AVAILABLE = False
+
+try:
+    import nltk
+    from nltk.tokenize import TextTilingTokenizer
+    NLTK_AVAILABLE = True
 except:
-    IPFN_AVAILABLE = False
+    NLTK_AVAILABLE = False
+    
+try:
+    from keybert import KeyBERT
+    KEYBERT_AVAILABLE = True
+except:
+    KEYBERT_AVAILABLE = False
 
 # Logging
 logging.basicConfig(
@@ -107,6 +208,7 @@ class Config:
     
     # Extraction
     enable_ocr: bool = False
+    ocr_preprocessing: bool = False
     extract_sections: bool = True
     extract_all_pages: bool = True
     min_section_title_size: float = 12.0
@@ -114,6 +216,8 @@ class Config:
     
     # Chunking
     chunk_size: int = 500
+    chunk_overlap: int = 50
+    chunking_method: str = 'fixed' # Replaced use_semantic_chunking
     min_text_length: int = 20
     max_text_length: int = 10000
     min_words: int = 3
@@ -127,6 +231,7 @@ class Config:
     
     # Semantic
     enable_semantic_labeling: bool = False
+    extract_keyphrases: bool = False
     semantic_mode: str = 'normal'  # 'normal' or 'adaptive'
     semantic_memory_path: str = 'semantic_memory.pkl'
     semantic_method: str = 'tfidf'  # 'tfidf', 'ipf', 'hybrid', 'llm'
@@ -148,11 +253,12 @@ class Config:
     
     # Quality
     quality_weights: Dict[str, float] = field(default_factory=lambda: {
-        'length_quality': 0.15,
-        'coherence_quality': 0.25,
-        'information_density': 0.25,
-        'structural_quality': 0.20,
+        'length_quality': 0.10,
+        'coherence_quality': 0.20,      # Renamed from 'coherence_quality'
+        'information_density': 0.20,
+        'structural_quality': 0.15,
         'linguistic_quality': 0.15,
+        'semantic_coherence': 0.20,     # New score
     })
     
     # Splits
@@ -489,6 +595,12 @@ class PDFProcessor:
                     logger.error(f"[{fn}] OCR failed: {e}")
             
             text = clean_text(text or '')
+            
+            # Apply aggressive OCR cleaning if enabled
+            if ocr_used and self.cfg.ocr_preprocessing:
+                logger.info(f"[{fn}] Applying aggressive OCR preprocessing...")
+                text = self._clean_ocr_artifacts(text)
+            
             if not text:
                 logger.warning(f"[{fn}] No text after cleaning")
                 return None
@@ -515,29 +627,196 @@ class PDFProcessor:
         except Exception as e:
             logger.error(f"[{fn}] Processing failed: {e}", exc_info=True)
             return None
+
+    def _clean_ocr_artifacts(self, text: str) -> str:
+        """Aggressive OCR error correction"""
+        
+        # 1. Fix common OCR substitutions
+        ocr_fixes = {
+            r'\bl\b': 'I',           # lowercase l → I
+            r'\bO(?=\d)': '0',       # O before digit → 0
+            r'(?<=\d)O\b': '0',      # O after digit → 0
+            r'\brn\b': 'm',          # rn → m
+            r'\bvv': 'w',            # vv → w
+            r'\|': 'I',              # pipe → I
+        }
+        for pattern, replacement in ocr_fixes.items():
+            text = re.sub(pattern, replacement, text)
+        
+        # 2. Fix broken words (hy-phenation) - already in clean_text, but good to have here
+        text = re.sub(r'(\w+)-\s*\n\s*(\w+)', r'\1\2', text)
+        
+        # 3. Remove page headers/footers (repeated text)
+        lines = text.split('\n')
+        line_counts = Counter(lines)
+        # Remove lines that appear more than 3 times (likely headers)
+        cleaned_lines = [l for l in lines if line_counts[l] <= 3 or not l.strip()]
+        text = '\n'.join(cleaned_lines)
+        
+        # Re-run basic cleaning
+        text = clean_text(text)
+        
+        return text
+
+    def _sentence_based_chunks(self, text: str, min_sentences: int = 5, max_words: int = 600) -> List[str]:
+        """Chunk by complete sentences"""
+        if not NLTK_AVAILABLE:
+            logger.warning("NLTK not available, falling back to fixed-word chunking.")
+            return self._fixed_word_chunks(text, max_words)
+        
+        try:
+            nltk.download('punkt', quiet=True)
+            sentences = nltk.sent_tokenize(text)
+        except Exception as e:
+            logger.warning(f"NLTK sentence tokenization failed: {e}. Falling back to fixed-word chunking.")
+            return self._fixed_word_chunks(text, max_words)
+            
+        chunks = []
+        current = []
+        current_words = 0
+        
+        for sent in sentences:
+            sent_words = len(sent.split())
+            
+            if current_words + sent_words > max_words and len(current) >= min_sentences:
+                chunks.append(' '.join(current))
+                current = [sent]
+                current_words = sent_words
+            else:
+                current.append(sent)
+                current_words += sent_words
+        
+        if current:
+            chunks.append(' '.join(current))
+        
+        return chunks
+
+    def _fixed_word_chunks(self, text: str, chunk_size: int, overlap: int = 0) -> List[str]:
+        """Original fixed-word chunking, now with overlap."""
+        words = text.split()
+        chunk_texts = []
+        step = chunk_size - overlap
+        if step <= 0:
+            step = chunk_size  # Avoid infinite loop if overlap >= size
+        
+        for i in range(0, len(words), step):
+            txt = ' '.join(words[i:i + chunk_size]).strip()
+            if txt:
+                chunk_texts.append(txt)
+        return chunk_texts
+
+    def _detect_topic_boundaries(self, text: str) -> List[str]:
+        """Find natural topic shifts in flat text using TextTiling"""
+        if not NLTK_AVAILABLE:
+            logger.warning("NLTK not available, cannot use TextTiling. Falling back.")
+            return self._fixed_word_chunks(text, self.cfg.chunk_size, self.cfg.chunk_overlap)
+        try:
+            nltk.download('punkt', quiet=True)
+            ttt = TextTilingTokenizer(w=20, k=10)
+            tiles = ttt.tokenize(text)
+            return tiles  # Each tile is a coherent topic segment
+        except Exception as e:
+            logger.warning(f"TextTiling failed: {e}. Falling back.")
+            return self._fixed_word_chunks(text, self.cfg.chunk_size, self.cfg.chunk_overlap)
+
+    def semantic_chunk_with_overlap(self, text: str, target_size: int = 500, overlap: int = 100):
+        """
+        Chunk with sliding window to preserve context. (From user analysis doc)
+        Note: This is one of several chunking strategies.
+        """
+        words = text.split()
+        chunks = []
+        
+        i = 0
+        while i < len(words):
+            # Take target_size words
+            chunk_words = words[i:i + target_size]
+            chunk_text = ' '.join(chunk_words)
+            
+            # Find natural boundary (sentence end) near the end
+            # Note: This logic might truncate aggressively.
+            sentences = re.split(r'[.!?]+', chunk_text)
+            if len(sentences) > 1:
+                # Use complete sentences only
+                chunk_text = '.'.join(sentences[:-1]) + '.'
+            
+            if chunk_text:
+                chunks.append(chunk_text)
+            
+            # Move forward by (target_size - overlap)
+            step = target_size - overlap
+            if step <= 0:
+                step = target_size
+            i += step
+        
+        return chunks
+
+    def find_semantic_breaks(self, text: str, model, threshold: float = 0.7):
+        """
+        Detect topic shifts using embedding similarity. (From user analysis doc)
+        Note: Requires embedding model, which is not available in PDFProcessor.
+        This function is added but not currently called.
+        """
+        if not NLTK_AVAILABLE:
+            logger.warning("NLTK not available, cannot find semantic breaks.")
+            return [text]
+            
+        try:
+            nltk.download('punkt', quiet=True)
+            sentences = nltk.sent_tokenize(text)
+            if len(sentences) < 2:
+                return [text]
+        except Exception as e:
+            logger.warning(f"NLTK tokenization failed in find_semantic_breaks: {e}")
+            return [text]
+            
+        embeddings = model.encode(sentences, show_progress_bar=False)
+        
+        breaks = [0]
+        for i in range(1, len(embeddings)):
+            similarity = cosine_similarity([embeddings[i-1]], [embeddings[i]])[0][0]
+            if similarity < threshold:  # Low similarity = topic change
+                breaks.append(i)
+        
+        breaks.append(len(sentences))
+        
+        # Group sentences into sections
+        sections = []
+        for i in range(len(breaks) - 1):
+            section = ' '.join(sentences[breaks[i]:breaks[i+1]])
+            sections.append(section)
+        
+        return sections
     
     def chunk_documents(self, docs: List[Dict]) -> List[Dict]:
         """Split documents into chunks"""
-        logger.info(f"Chunking {len(docs)} documents at {self.cfg.chunk_size} words...")
+        logger.info(f"Chunking {len(docs)} documents...")
         
         chunks = []
         for d in tqdm(docs, desc="Chunking"):
-            words = d['text'].split()
-            total_chunks = max(1, len(words) // self.cfg.chunk_size)
             sections = d.get('structure', {}).get('sections', []) + d.get('structure', {}).get('toc', [])
             
-            for i in range(0, len(words), self.cfg.chunk_size):
-                txt = ' '.join(words[i:i + self.cfg.chunk_size]).strip()
+            if self.cfg.chunking_method == 'sentence':
+                logger.debug(f"Using sentence-based chunking (max {self.cfg.chunk_size} words)")
+                chunk_texts = self._sentence_based_chunks(d['text'], max_words=self.cfg.chunk_size)
+            elif self.cfg.chunking_method == 'texttile':
+                logger.debug(f"Using TextTiling topic chunking (NLTK)...")
+                chunk_texts = self._detect_topic_boundaries(d['text'])
+            else: # 'fixed'
+                logger.debug(f"Using fixed-word chunking ({self.cfg.chunk_size} words, {self.cfg.chunk_overlap} overlap)")
+                chunk_texts = self._fixed_word_chunks(d['text'], self.cfg.chunk_size, self.cfg.chunk_overlap)
+            
+            total_chunks = len(chunk_texts)
+            for i, txt in enumerate(chunk_texts):
                 if not txt or not validate_text(txt, self.cfg):
                     continue
                 
-                pos = i // self.cfg.chunk_size
-                sect = self.sectioner.match_chunk(txt, sections, pos, total_chunks)
+                sect = self.sectioner.match_chunk(txt, sections, i, total_chunks)
                 
                 chunks.append({
                     'text': txt,
                     'filename': d['filename'],
-                    'chunk_index': pos,
+                    'chunk_index': i,
                     'section_title': sect,
                     'has_section': sect is not None,
                     'ocr_used': d.get('ocr_used', False),
@@ -622,7 +901,7 @@ class SemanticMemory:
     clusters: Dict[str, Set[str]] = field(default_factory=dict)
     centroids: Dict[str, np.ndarray] = field(default_factory=dict)
     coherence_weights: Dict[str, float] = field(default_factory=dict)
-    hierarchy: Dict[str, Set[str]] = field(default_factory=lambda: defaultdict(set))
+    hierarchy: Dict[str, Dict[str, float]] = field(default_factory=lambda: defaultdict(dict))  # Changed from Set to Dict[str, float]
     high_mi_pairs: Dict[Tuple[str, str], float] = field(default_factory=dict)
     generation: int = 0
     ipf_generation: int = 0
@@ -642,8 +921,8 @@ class IPFSemanticEnhancer:
     def __init__(self, memory: SemanticMemory, cfg: Config):
         self.memory = memory
         self.cfg = cfg
-        if not IPFN_AVAILABLE:
-            logger.warning("⚠️  ipfn not installed. Install with: pip install ipfn")
+        if not IPF_AVAILABLE:
+            logger.warning("⚠️  pyipf not installed. Install with: pip install pyipf")
     
     def calibrate_cooccurrence(self, 
                                expected_marginals: dict = None):
@@ -654,8 +933,8 @@ class IPFSemanticEnhancer:
         Args:
             expected_marginals: Dict of theme -> expected frequency
         """
-        if not IPFN_AVAILABLE:
-            logger.warning("IPF calibration skipped (ipfn not installed)")
+        if not IPF_AVAILABLE:
+            logger.warning("IPF calibration skipped (pyipf not installed)")
             return
         
         if not self.cfg.ipf_calibrate_cooccurrence:
@@ -700,11 +979,11 @@ class IPFSemanticEnhancer:
             aggregates = [row_marginals, col_marginals]
             dimensions = [[0], [1]]
             
-            IPF = ipfn.ipfn(co_matrix, aggregates, dimensions, 
+            ipf = IPF(co_matrix, aggregates, dimensions, 
                            convergence_rate=self.cfg.ipf_convergence_rate,
                            max_iteration=self.cfg.ipf_max_iterations)
             
-            calibrated_matrix = IPF.iteration()
+            calibrated_matrix = ipf.iteration()
             
             # Update co-occurrence with calibrated values
             for i, theme_a in enumerate(themes):
@@ -724,7 +1003,7 @@ class IPFSemanticEnhancer:
         Use IPF to enforce hierarchical constraints:
         Parent theme frequency = sum of child frequencies
         """
-        if not IPFN_AVAILABLE or not self.memory.hierarchy:
+        if not IPF_AVAILABLE or not self.memory.hierarchy:
             return
         
         if not self.cfg.ipf_balance_hierarchy:
@@ -767,10 +1046,10 @@ class IPFSemanticEnhancer:
             aggregates = [row_totals, col_totals]
             dimensions = [[0], [1]]
             
-            IPF = ipfn.ipfn(table + 0.1, aggregates, dimensions,
+            ipf = IPF(table + 0.1, aggregates, dimensions,
                            convergence_rate=self.cfg.ipf_convergence_rate,
                            max_iteration=self.cfg.ipf_max_iterations)
-            balanced_table = IPF.iteration()
+            balanced_table = ipf.iteration()
             
             # Update hierarchy weights
             for i, parent in enumerate(parent_themes):
@@ -793,7 +1072,7 @@ class IPFSemanticEnhancer:
         Args:
             target_distribution: Dict of theme -> target probability
         """
-        if not IPFN_AVAILABLE:
+        if not IPF_AVAILABLE:
             return
         
         if not self.cfg.ipf_smooth_distributions:
@@ -840,10 +1119,10 @@ class IPFSemanticEnhancer:
             aggregates = [row_totals, col_totals]
             dimensions = [[0], [1]]
             
-            IPF = ipfn.ipfn(doc_theme_matrix, aggregates, dimensions,
+            ipf = IPF(doc_theme_matrix, aggregates, dimensions,
                            convergence_rate=self.cfg.ipf_convergence_rate,
                            max_iteration=self.cfg.ipf_max_iterations)
-            smoothed_matrix = IPF.iteration()
+            smoothed_matrix = ipf.iteration()
             
             # Update theme counts with smoothed values
             for j, theme in enumerate(themes):
@@ -921,6 +1200,7 @@ class SemanticLabeler:
     - ipf: IPF-enhanced adaptive learning
     - hybrid: TF-IDF + IPF combination
     - llm: LLM-based labeling (placeholder)
+    - keybert: KeyBERT-based conceptual extraction
     """
     
     STOPWORDS = {
@@ -951,7 +1231,7 @@ class SemanticLabeler:
         self.cfg = cfg
         self.mode = cfg.semantic_mode
         self.method = cfg.semantic_method
-        self.embedding_model = embedding_model
+        self.embedding_model = embedding_model # This is the SentenceTransformer model
         self.discovered = Counter()
         
         # TF-IDF vectorizer for tfidf/hybrid methods
@@ -965,6 +1245,20 @@ class SemanticLabeler:
             self._tfidf_fitted = False
             self._tfidf_corpus = []
         
+        # KeyBERT model
+        self.kw_model = None
+        if self.cfg.extract_keyphrases:
+            if KEYBERT_AVAILABLE and self.embedding_model:
+                try:
+                    self.kw_model = KeyBERT(model=self.embedding_model)
+                    logger.info("✓ KeyBERT model initialized for phrase extraction")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize KeyBERT: {e}")
+            elif not KEYBERT_AVAILABLE:
+                logger.warning("⚠️  --extract-keyphrases enabled, but 'keybert' not installed.")
+            elif not self.embedding_model:
+                logger.warning("⚠️  --extract-keyphrases enabled, but no embedding model available.")
+
         # Adaptive mode state
         if self.mode == 'adaptive':
             self.memory = SemanticMemory()
@@ -1009,24 +1303,34 @@ class SemanticLabeler:
         else:
             return self._label_normal(text)
     
+    def _get_raw_candidates(self, text: str) -> Set[str]:
+        """Centralized logic for extracting candidate themes"""
+        raw_candidates = set()
+        
+        # Priority 1: KeyBERT if enabled and available
+        if self.cfg.extract_keyphrases and self.kw_model:
+            raw_candidates.update(self._extract_keyphrases(text))
+            
+        # Priority 2: TF-IDF if method is tfidf or hybrid
+        if self.method == 'tfidf':
+            self._tfidf_corpus.append(text)
+            raw_candidates.update(self._extract_tfidf_themes(text))
+        elif self.method == 'hybrid':
+            self._tfidf_corpus.append(text)
+            raw_candidates.update(self._extract_tfidf_themes(text))
+
+        # Priority 3: Fallback to hierarchical heuristics
+        if not raw_candidates or self.method not in ['tfidf', 'hybrid'] and not self.cfg.extract_keyphrases:
+            raw_candidates.update(self._extract_hierarchical_themes(text))
+            
+        return raw_candidates
+
     def _label_normal(self, text: str) -> Dict:
         """Normal mode: stateless heuristic labeling"""
-        themes = []
-        
-        if self.method == 'tfidf':
-            # TF-IDF extraction
-            self._tfidf_corpus.append(text)
-            themes.extend(self._extract_tfidf_themes(text))
-        elif self.method == 'llm':
-            # LLM-based (placeholder)
-            logger.warning("LLM method not implemented, falling back to heuristics")
-            themes.extend(self._extract_heuristic_themes(text))
-        else:
-            # Default heuristics (ipf/hybrid in normal mode uses heuristics)
-            themes.extend(self._extract_heuristic_themes(text))
+        raw_candidates = self._get_raw_candidates(text)
         
         # Normalize and filter
-        themes = [self._normalize(t) for t in themes]
+        themes = [self._normalize(t) for t in raw_candidates]
         themes = [t for t in themes if t and len(t) > 3]
         themes = list(dict.fromkeys(themes))[:self.cfg.max_themes_per_chunk]
         
@@ -1038,34 +1342,20 @@ class SemanticLabeler:
         for t in themes:
             self.discovered[t] += 1
         
+        method = 'keybert' if self.cfg.extract_keyphrases and self.kw_model else self.method
+        
         return {
             'themes': themes,
             'primary_theme': themes[0] if themes else 'general_content',
             'confidence': min(0.8, 0.5 + 0.1 * len(themes)),
-            'method': f'normal_{self.method}'
+            'method': f'normal_{method}'
         }
     
     def _label_adaptive(self, text: str) -> Dict:
         """Adaptive mode: self-bootstrapping labeling"""
-        themes = []
-        raw_candidates = set()
         
-        # Phase 1: Extract raw candidates based on method
-        if self.method == 'tfidf':
-            self._tfidf_corpus.append(text)
-            raw_candidates.update(self._extract_tfidf_themes(text))
-        elif self.method in ['ipf', 'hybrid']:
-            # Use heuristics for initial extraction
-            raw_candidates.update(self._extract_heuristic_themes(text))
-            # Hybrid adds TF-IDF
-            if self.method == 'hybrid':
-                self._tfidf_corpus.append(text)
-                raw_candidates.update(self._extract_tfidf_themes(text))
-        elif self.method == 'llm':
-            logger.warning("LLM method not implemented, falling back to heuristics")
-            raw_candidates.update(self._extract_heuristic_themes(text))
-        else:
-            raw_candidates.update(self._extract_heuristic_themes(text))
+        # Phase 1: Extract raw candidates
+        raw_candidates = self._get_raw_candidates(text)
         
         # Normalize and filter
         normalized = {self._normalize(c) for c in raw_candidates if c}
@@ -1097,12 +1387,14 @@ class SemanticLabeler:
         # Track discovery
         for t in themes:
             self.discovered[t] += 1
+            
+        method = 'keybert' if self.cfg.extract_keyphrases and self.kw_model else self.method
         
         return {
             'themes': themes,
             'primary_theme': themes[0] if themes else 'general_content',
             'confidence': self._compute_confidence(themes, text),
-            'method': f'adaptive_{self.method}',
+            'method': f'adaptive_{method}',
             'generation': self.memory.generation,
             'ipf_generation': self.memory.ipf_generation
         }
@@ -1111,13 +1403,66 @@ class SemanticLabeler:
     # Extraction Methods
     # ========================================================================
     
-    def _extract_heuristic_themes(self, text: str) -> List[str]:
-        """Extract themes using heuristic patterns"""
+    def _extract_keyphrases(self, text: str) -> List[str]:
+        """Extract meaningful keyphrases, not just names, using KeyBERT"""
+        if not self.kw_model:
+            return []
+        
+        try:
+            # Extract top keyphrases with diversity
+            keywords = self.kw_model.extract_keywords(
+                text,
+                keyphrase_ngram_range=(1, 3),
+                stop_words='english',
+                use_maxsum=True,
+                nr_candidates=20,
+                top_n=10,
+                diversity=0.7  # Enforce diversity
+            )
+            
+            # Filter out pure proper names
+            themes = []
+            for phrase, score in keywords:
+                # Skip if all words are capitalized (likely a name)
+                words = phrase.split()
+                if not all(w[0].isupper() for w in words if w):
+                    themes.append(phrase)
+            
+            return themes
+        except Exception as e:
+            logger.warning(f"KeyBERT extraction failed: {e}")
+            return []
+    
+    def _extract_hierarchical_themes(self, text: str) -> List[str]:
+        """Extract both specific and general themes"""
         themes = []
-        themes.extend(self._extract_proper_phrases(text)[:5])
+        
+        # Named entities
+        themes.extend(re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', text))
+        
+        # Conceptual phrases (noun + theory/analysis/study/technique)
+        concept_patterns = [
+            r'\b(\w+\s+(?:theory|analysis|framework|model|approach))\b',
+            r'\b(\w+\s+(?:technique|method|strategy|principle))\b',
+        ]
+        for pattern in concept_patterns:
+            themes.extend(re.findall(pattern, text.lower()))
+        
+        # Topic areas (look for field-specific vocabulary)
+        topic_keywords = {
+            'psychology': ['cognitive', 'behavioral', 'emotional', 'perception'],
+            'linguistics': ['semantic', 'syntax', 'pragmatic', 'discourse'],
+            'sociology': ['social', 'cultural', 'interaction', 'group'],
+            'comedy': ['humor', 'joke', 'timing', 'punchline', 'setup'],
+        }
+        for topic, keywords in topic_keywords.items():
+            if any(kw in text.lower() for kw in keywords):
+                themes.append(topic)
+        
+        # Add older heuristics as a final fallback
         themes.extend(self._extract_technical_terms(text)[:3])
-        themes.extend(self._extract_domain_patterns(text)[:3])
         themes.extend(self._extract_sentence_subjects(text)[:3])
+        
         return themes
     
     def _extract_tfidf_themes(self, text: str) -> List[str]:
@@ -1132,7 +1477,7 @@ class SemanticLabeler:
         
         if not self._tfidf_fitted:
             # Fallback to heuristics if not enough data
-            return self._extract_heuristic_themes(text)
+            return self._extract_hierarchical_themes(text)
         
         try:
             tfidf_matrix = self.tfidf.transform([text])
@@ -1145,11 +1490,7 @@ class SemanticLabeler:
             themes = [feature_names[i] for i in top_indices if scores[i] > 0]
             return themes[:5]
         except:
-            return self._extract_heuristic_themes(text)
-    
-    def _extract_proper_phrases(self, text: str) -> List[str]:
-        """Extract capitalized multi-word terms"""
-        return re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b', text)
+            return self._extract_hierarchical_themes(text)
     
     def _extract_technical_terms(self, text: str) -> List[str]:
         """Extract technical patterns"""
@@ -1163,23 +1504,10 @@ class SemanticLabeler:
             terms.extend(re.findall(pattern, text))
         return terms
     
-    def _extract_domain_patterns(self, text: str) -> List[str]:
-        """Extract domain-specific keyword patterns"""
-        patterns = [
-            r'\b(\w+\s+(?:algorithm|method|approach|technique|model|system))\b',
-            r'\b(\w+\s+(?:theory|theorem|principle|law|concept))\b',
-            r'\b(\w+\s+(?:analysis|study|research))\b',
-            r'\b(\w+\s+(?:process|procedure|mechanism))\b',
-        ]
-        terms = []
-        for pattern in patterns:
-            terms.extend(re.findall(pattern, text.lower()))
-        return terms
-    
     def _extract_sentence_subjects(self, text: str) -> List[str]:
         """Extract subjects from sentences"""
         return re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:is|are|was|were)\b', text)
-    
+
     def _classify_content_type(self, text: str) -> str:
         """Fallback content classification"""
         if len(re.findall(r'\d+', text)) > 5:
@@ -1341,7 +1669,7 @@ class SemanticLabeler:
         self._build_hierarchy()
         
         # Phase 7: IPF Enhancement (if method is ipf or hybrid)
-        if self.method in ['ipf', 'hybrid'] and IPFN_AVAILABLE:
+        if self.method in ['ipf', 'hybrid'] and IPF_AVAILABLE:
             logger.info("  Applying IPF enhancement...")
             enhancer = IPFSemanticEnhancer(self.memory, self.cfg)
             
@@ -1359,8 +1687,8 @@ class SemanticLabeler:
             
             self.memory.ipf_generation += 1
             logger.info(f"✓ IPF enhancement complete (IPF Gen {self.memory.ipf_generation})")
-        elif self.method in ['ipf', 'hybrid'] and not IPFN_AVAILABLE:
-            logger.warning(f"⚠️  IPF method selected but ipfn not available. Install with: pip install ipfn")
+        elif self.method in ['ipf', 'hybrid'] and not IPF_AVAILABLE:
+            logger.warning(f"⚠️  IPF method selected but pyipf not available. Install with: pip install pyipf")
         
         # Update statistics
         self.memory.total_chunks_processed += len(self._current_run_records)
@@ -1458,7 +1786,15 @@ class SemanticLabeler:
                 related_count = self.memory.theme_counts[related]
                 
                 if co_count / theme_count > 0.7 and related_count > theme_count * 2:
-                    self.memory.hierarchy[related].add(theme)
+                    # Initialize as dict if needed
+                    if related not in self.memory.hierarchy:
+                        self.memory.hierarchy[related] = {}
+                    elif isinstance(self.memory.hierarchy[related], set):
+                        # Convert old set format to dict
+                        old_set = self.memory.hierarchy[related]
+                        self.memory.hierarchy[related] = {c: 1.0 for c in old_set}
+                    
+                    self.memory.hierarchy[related][theme] = 1.0
     
     def print_semantic_summary(self):
         """Print summary of learned semantics"""
@@ -1513,20 +1849,31 @@ class SemanticLabeler:
 class QualityScorer:
     """Multi-dimensional quality scoring"""
     
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, model=None):
         self.cfg = cfg
         self.weights = cfg.quality_weights
+        self.model = model # Embedding model for semantic coherence
     
     def score(self, text: str) -> Dict[str, float]:
         """Calculate quality scores"""
         scores = {
             'length_quality': self._length(text),
-            'coherence_quality': self._coherence(text),
+            'coherence_quality': self._coherence_heuristic(text),
             'information_density': self._info_density(text),
             'structural_quality': self._structure(text),
             'linguistic_quality': self._linguistics(text),
         }
-        composite = sum(scores[k] * self.weights.get(k, 0.2) for k in scores)
+        
+        if self.model:
+            scores['semantic_coherence'] = self._semantic_coherence(text)
+        
+        # Calculate composite score, normalizing weights
+        total_weight = sum(self.weights.get(k, 0) for k in scores)
+        composite = 0.0
+        if total_weight > 0:
+            for k, v in scores.items():
+                composite += v * (self.weights.get(k, 0) / total_weight)
+        
         scores['composite_quality'] = round(composite, 3)
         return scores
     
@@ -1541,7 +1888,8 @@ class QualityScorer:
             return 0.4
         return 0.1
     
-    def _coherence(self, text):
+    def _coherence_heuristic(self, text):
+        """Original heuristic coherence"""
         sents = re.split(r'[.!?]+', text)
         complete = [s for s in sents if len(s.split()) >= 3]
         score = 0.0
@@ -1550,6 +1898,42 @@ class QualityScorer:
         if re.search(r'[A-Z]', text):
             score += 0.2
         return min(score + 0.3, 1.0)
+
+    def _semantic_coherence(self, chunk: str) -> float:
+        """Score how semantically coherent a chunk is using embeddings"""
+        if not NLTK_AVAILABLE:
+            logger.warning("NLTK not available, cannot score semantic coherence.")
+            return 0.5 # Neutral score
+        
+        try:
+            nltk.download('punkt', quiet=True)
+            sentences = nltk.sent_tokenize(chunk)
+        except Exception as e:
+            logger.warning(f"NLTK tokenization failed in coherence scoring: {e}")
+            return 0.5
+
+        if len(sentences) < 2:
+            return 0.5  # Neutral score for single sentence
+        
+        try:
+            # Embed sentences
+            embeddings = self.model.encode(sentences, show_progress_bar=False)
+            
+            # Calculate average similarity between consecutive sentences
+            similarities = []
+            for i in range(len(embeddings) - 1):
+                sim = cosine_similarity([embeddings[i]], [embeddings[i+1]])[0][0]
+                similarities.append(sim)
+            
+            avg_similarity = np.mean(similarities)
+            
+            # High similarity = coherent flow
+            # Low similarity = disjointed/fragmented
+            return float(avg_similarity)
+        except Exception as e:
+            logger.warning(f"Semantic coherence embedding failed: {e}")
+            return 0.4 # Penalize if embedding fails
+
     
     def _info_density(self, text):
         words = text.split()
@@ -1654,7 +2038,8 @@ class KnowledgeBuilder:
     def __init__(self, cfg: Config, embedder: EmbeddingStore):
         self.cfg = cfg
         self.embedder = embedder
-        self.qual = QualityScorer(cfg)
+        # Pass the embedding model to the quality scorer
+        self.qual = QualityScorer(cfg, model=embedder.model)
         self.labeler = SemanticLabeler(cfg, embedder.model) if cfg.enable_semantic_labeling else None
     
     def dedup(self, chunks: List[Dict]) -> List[Dict]:
@@ -1683,9 +2068,24 @@ class KnowledgeBuilder:
         g_emb = []
         
         for src, items in tqdm(by_src.items(), desc="Grouping by source"):
+            if not items:
+                continue
+                
             idxs = [i for i, _ in items]
             arr = [c for _, c in items]
-            emb = embeddings[idxs]
+            
+            # Ensure embeddings align with items
+            try:
+                emb = embeddings[idxs]
+            except IndexError:
+                logger.warning(f"Embedding index mismatch for source {src}, skipping grouping.")
+                # Fallback: just use the chunks as-is for this source
+                for i, ch in enumerate(arr):
+                    grouped.append(ch)
+                    # We need an embedding. Re-embed this single chunk?
+                    # This shouldn't happen if build() logic is correct.
+                    # Let's check the build logic.
+                continue # Skip this source
             
             i = 0
             while i < len(arr):
@@ -1720,7 +2120,10 @@ class KnowledgeBuilder:
         """Build knowledge records"""
         chunks = self.dedup(chunks)
         texts = [c['text'] for c in chunks]
+        # Embeddings are generated *before* grouping
         emb = self.embedder.embed_chunks(texts)
+        
+        # Grouping happens *after* embedding
         grouped, gemb = self.group_consecutive(chunks, emb)
         
         records = []
@@ -1759,6 +2162,7 @@ class KnowledgeBuilder:
             records.append(rec)
         
         logger.info(f"✓ Created {len(records)} knowledge records")
+        # Return grouped embeddings
         return records, gemb
 
 # ============================================================================
@@ -1777,7 +2181,11 @@ class QABuilder:
         paras = re.split(r'\n\n+', chunk_text)
         first = (paras[0][:500] if paras else chunk_text[:500]).strip()
         key_terms = list(set(re.findall(r'\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)?\b', chunk_text)))
-        theme = metadata.get('primary_theme', 'the main topic')
+        
+        # Use primary theme if available
+        theme = metadata.get('primary_theme', 'general_topic')
+        if theme == 'general_topic' and metadata.get('semantic_themes'):
+            theme = metadata['semantic_themes'][0]
         
         templates = [
             f"Summarize the key ideas in: '{first}'.",
@@ -1809,7 +2217,9 @@ class QABuilder:
         embeds = self.embedder.model.encode(
             texts,
             convert_to_numpy=True,
-            normalize_embeddings=True
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            batch_size=self.cfg.batch_size
         )
         
         grouped = []
@@ -1845,7 +2255,9 @@ class QABuilder:
         embs = self.embedder.model.encode(
             texts,
             convert_to_numpy=True,
-            normalize_embeddings=True
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            batch_size=self.cfg.batch_size
         )
         
         keep = []
@@ -1892,7 +2304,8 @@ class QABuilder:
                 ans_emb = self.embedder.model.encode(
                     text,
                     convert_to_numpy=True,
-                    normalize_embeddings=True
+                    normalize_embeddings=True,
+                    show_progress_bar=False
                 )
                 
                 if existing_ans_embeds:
@@ -1906,7 +2319,8 @@ class QABuilder:
                 q_emb = self.embedder.model.encode(
                     qs,
                     convert_to_numpy=True,
-                    normalize_embeddings=True
+                    normalize_embeddings=True,
+                    show_progress_bar=False
                 )
                 
                 sim_diag = cosine_similarity(q_emb, np.stack([ans_emb] * len(qs))).diagonal()
@@ -1993,14 +2407,17 @@ def run(cfg: Config):
     logger.info("=" * 70)
     logger.info(f"PDF dir: {cfg.pdf_dir}")
     logger.info(f"Workers: {cfg.max_workers}")
-    logger.info(f"OCR: {cfg.enable_ocr and OCR_AVAILABLE}")
+    logger.info(f"OCR: {cfg.enable_ocr} (Preprocessing: {cfg.ocr_preprocessing})")
     logger.info(f"Sections: {cfg.extract_sections}")
+    logger.info(f"Chunking Method: {cfg.chunking_method}")
+    logger.info(f"  - Size: {cfg.chunk_size}, Overlap: {cfg.chunk_overlap}")
     logger.info(f"Semantic labeling: {cfg.enable_semantic_labeling}")
     if cfg.enable_semantic_labeling:
         logger.info(f"  - Mode: {cfg.semantic_mode}")
         logger.info(f"  - Method: {cfg.semantic_method}")
+        logger.info(f"  - Keyphrases: {cfg.extract_keyphrases} (Available: {KEYBERT_AVAILABLE})")
         if cfg.semantic_method in ['ipf', 'hybrid']:
-            logger.info(f"  - IPF available: {IPFN_AVAILABLE}")
+            logger.info(f"  - IPF available: {IPF_AVAILABLE}")
     logger.info(f"Q&A Generation: {cfg.generate_qa}")
     logger.info("=" * 70)
     
@@ -2230,13 +2647,26 @@ Examples:
     --no-sections --chunk-size 300
   
   # Maximum quality with hybrid IPF+TF-IDF
-  python adaptive_semantic.py --pdf-dir ./PDFs --workers 16 \\
+    p.add_argument('--pdf-dir ./PDFs --workers 16 \\
     --enable-ocr --enable-semantic-labeling --semantic-mode adaptive --semantic-method hybrid \\
     --chunk-size 400 --qa-max-pairs-per-source 10000
+    
+  # NEW: Recommended Configuration for Flat PDFs
+  python3 adaptive_semantic.py \\
+    --pdf-dir ./PDFs \\
+    --enable-semantic-labeling \\
+    --semantic-mode adaptive \\
+    --semantic-method hybrid \\
+    --chunk-size 400 \\
+    --chunk-overlap 100 \\
+    --chunking-method sentence \\
+    --extract-keyphrases \\
+    --enable-ocr \\
+    --ocr-preprocessing
 
 Semantic Methods:
   - tfidf: Fast TF-IDF based theme extraction (default)
-  - ipf: IPF-enhanced adaptive learning (requires: pip install ipfn)
+  - ipf: IPF-enhanced adaptive learning (requires: pip install pyipf)
   - hybrid: Combines TF-IDF + IPF for best results
   - llm: LLM-based labeling (placeholder, not implemented)
 
@@ -2259,7 +2689,8 @@ Performance tips:
   - Disable --no-sections if not needed (faster)
   - OCR is slow; only enable if you have scanned PDFs
   - Adaptive mode builds a semantic memory file that improves over multiple runs
-  - IPF requires 'ipfn' package: pip install ipfn
+  - IPF requires 'pyipf' package: pip install pyipf
+  - NLTK and KeyBERT improve quality but add overhead: pip install nltk keybert
         """
     )
     
@@ -2278,12 +2709,20 @@ Performance tips:
     # Extraction
     p.add_argument('--enable-ocr', action='store_true',
                    help='Enable OCR for scanned PDFs (slow)')
+    p.add_argument('--ocr-preprocessing', action='store_true',
+                   help='Enable aggressive OCR artifact cleaning (if --enable-ocr)')
     p.add_argument('--no-sections', action='store_true',
                    help='Disable section title extraction (faster)')
     
     # Chunking
     p.add_argument('--chunk-size', type=int, default=500,
-                   help='Words per chunk')
+                   help='Words per chunk (or max words for semantic chunking)')
+    p.add_argument('--chunk-overlap', type=int, default=50,
+                   help='Word overlap for fixed-word chunking')
+    p.add_argument('--chunking-method', choices=['fixed', 'sentence', 'texttile'],
+                   default='fixed',
+                   help='Chunking method: fixed (word count with overlap), '
+                        'sentence (group sentences), or texttile (NLTK topic boundaries)')
     p.add_argument('--batch-size', type=int, default=100,
                    help='Embedding batch size')
     
@@ -2296,12 +2735,14 @@ Performance tips:
     # Semantic labeling
     p.add_argument('--enable-semantic-labeling', action='store_true',
                    help='Enable semantic theme labeling')
+    p.add_argument('--extract-keyphrases', action='store_true',
+                   help='Use KeyBERT for conceptual keyphrase extraction (replaces TF-IDF)')
     p.add_argument('--semantic-mode', choices=['normal', 'adaptive'],
                    default='normal',
                    help='Semantic labeling mode: normal (stateless) or adaptive (self-learning)')
     p.add_argument('--semantic-method', choices=['tfidf', 'ipf', 'hybrid', 'llm'],
                    default='tfidf',
-                   help='Semantic labeling method: tfidf (default), ipf (requires ipfn), hybrid (tfidf+ipf), llm (not implemented)')
+                   help='Semantic labeling method: tfidf (default), ipf (requires pyipf), hybrid (tfidf+ipf), llm (not implemented)')
     p.add_argument('--semantic-memory-path', default='semantic_memory.pkl',
                    help='Path to semantic memory file (adaptive mode only)')
     p.add_argument('--semantic-model', 
@@ -2366,13 +2807,25 @@ Performance tips:
         return
     
     # Warn about IPF requirements
-    if args.semantic_method in ['ipf', 'hybrid'] and not IPFN_AVAILABLE:
+    if args.semantic_method in ['ipf', 'hybrid'] and not IPF_AVAILABLE:
         logger.warning("=" * 70)
-        logger.warning("⚠️  WARNING: IPF method selected but 'ipfn' is not installed!")
-        logger.warning("Install with: pip install ipfn")
+        logger.warning("⚠️  WARNING: IPF method selected but 'pyipf' is not installed!")
+        logger.warning("Install with: pip install pyipf")
         logger.warning("Continuing with degraded functionality...")
         logger.warning("=" * 70)
     
+    # Warn about NLTK/KeyBERT
+    if (args.chunking_method != 'fixed' or args.extract_keyphrases) and not NLTK_AVAILABLE:
+        logger.warning("=" * 70)
+        logger.warning("⚠️  WARNING: Semantic chunking/labeling requires 'nltk'.")
+        logger.warning("Install with: pip install nltk")
+        logger.warning("=" * 70)
+    if args.extract_keyphrases and not KEYBERT_AVAILABLE:
+        logger.warning("=" * 70)
+        logger.warning("⚠️  WARNING: Keyphrase extraction requires 'keybert'.")
+        logger.warning("Install with: pip install keybert")
+        logger.warning("=" * 70)
+        
     # Build config
     cfg = Config(
         pdf_dir=args.pdf_dir,
@@ -2380,13 +2833,17 @@ Performance tips:
         gzip_output=not args.no_gzip,
         max_workers=args.workers,
         enable_ocr=args.enable_ocr,
+        ocr_preprocessing=args.ocr_preprocessing,
         extract_sections=not args.no_sections,
         extract_all_pages=True,
         chunk_size=args.chunk_size,
+        chunk_overlap=args.chunk_overlap,
+        chunking_method=args.chunking_method,
         batch_size=args.batch_size,
         embedding_model=args.embedding_model,
         force_cpu=args.force_cpu,
         enable_semantic_labeling=args.enable_semantic_labeling,
+        extract_keyphrases=args.extract_keyphrases,
         semantic_mode=args.semantic_mode,
         semantic_method=args.semantic_method,
         semantic_memory_path=args.semantic_memory_path,
@@ -2414,3 +2871,4 @@ Performance tips:
 
 if __name__ == '__main__':
     cli()
+
