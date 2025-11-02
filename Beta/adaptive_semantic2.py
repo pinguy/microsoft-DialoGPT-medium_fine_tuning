@@ -37,7 +37,7 @@ Usage:
 python3 adaptive_semantic2.py --pdf-dir ./PDFs --force-cpu --enable-semantic-labeling --semantic-mode normal --semantic-method hybrid --extract-keyphrases --no-save-intermediates
 
 # Recommended Configuration for Flat PDFs (with new improvements)
-python3 adaptive_semantic.py \
+python3 adaptive_semantic2.py \
   --pdf-dir ./PDFs \
   --enable-semantic-labeling \
   --semantic-mode adaptive \
@@ -2649,32 +2649,32 @@ def cli():
         epilog="""
 Examples:
   # Basic usage with parallel processing
-  python adaptive_semantic.py --pdf-dir ./PDFs --workers 16
+  python adaptive_semantic2.py --pdf-dir ./PDFs --workers 16
   
   # Normal semantic mode with TF-IDF (default, stateless heuristics)
-  python adaptive_semantic.py --pdf-dir ./PDFs --enable-semantic-labeling
+  python adaptive_semantic2.py --pdf-dir ./PDFs --enable-semantic-labeling
   
   # Adaptive semantic mode with TF-IDF
-  python adaptive_semantic.py --pdf-dir ./PDFs --enable-semantic-labeling --semantic-mode adaptive
+  python adaptive_semantic2.py --pdf-dir ./PDFs --enable-semantic-labeling --semantic-mode adaptive
   
   # Adaptive mode with IPF enhancement (learns from previous runs)
-  python adaptive_semantic.py --pdf-dir ./PDFs --enable-semantic-labeling --semantic-mode adaptive --semantic-method ipf
+  python adaptive_semantic2.py --pdf-dir ./PDFs --enable-semantic-labeling --semantic-mode adaptive --semantic-method ipf
   
   # Hybrid mode (TF-IDF + IPF combination)
-  python adaptive_semantic.py --pdf-dir ./PDFs --enable-semantic-labeling --semantic-mode adaptive --semantic-method hybrid
+  python adaptive_semantic2.py --pdf-dir ./PDFs --enable-semantic-labeling --semantic-mode adaptive --semantic-method hybrid
   
   # Run on CPU even if GPU is available
-  python adaptive_semantic.py --pdf-dir ./PDFs --force-cpu
+  python adaptive_semantic2.py --pdf-dir ./PDFs --force-cpu
   
   # Disable Q&A generation for a faster memory-only run
-  python adaptive_semantic.py --pdf-dir ./PDFs --no-qa
+  python adaptive_semantic2.py --pdf-dir ./PDFs --no-qa
 
   # Full features: OCR + adaptive IPF semantic labeling
-  python adaptive_semantic.py --pdf-dir ./PDFs --workers 16 \\
+  python adaptive_semantic2.py --pdf-dir ./PDFs --workers 16 \\
     --enable-ocr --enable-semantic-labeling --semantic-mode adaptive --semantic-method ipf
   
   # Fast mode: no sections, no semantic labeling
-  python adaptive_semantic.py --pdf-dir ./PDFs --workers 32 \\
+  python adaptive_semantic2.py --pdf-dir ./PDFs --workers 32 \\
     --no-sections --chunk-size 300
   
   # Maximum quality with hybrid IPF+TF-IDF
@@ -2683,7 +2683,7 @@ Examples:
     --chunk-size 400 --qa-max-pairs-per-source 10000
     
   # NEW: Recommended Configuration for Flat PDFs
-  python3 adaptive_semantic.py \\
+  python3 adaptive_semantic2.py \\
     --pdf-dir ./PDFs \\
     --enable-semantic-labeling \\
     --semantic-mode adaptive \\
@@ -2902,4 +2902,3 @@ Performance tips:
 
 if __name__ == '__main__':
     cli()
-
