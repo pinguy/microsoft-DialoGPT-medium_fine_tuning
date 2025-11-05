@@ -64,7 +64,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 @dataclass
 class Config:
-    base_dir: str = "./dialogpt-finetuned/"
+    base_dir: str = "./placeholder-finetuned/"
     vosk_model_path: str = "vosk-model-en-us-0.42-gigaspeech"
     server_port: int = 7860
     auto_open_browser: bool = True
