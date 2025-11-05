@@ -999,30 +999,30 @@ class DeepSeekQwenTrainer:
             "learning_rate": 5e-5,
             "weight_decay": 0.01,
             "warmup_steps": 100,
-            "logging_steps": 25, # Log every 25 steps
-            "save_steps": 100,   # Save checkpoint every 100 steps
-            "save_total_limit": 2, # Keep only the 2 most recent checkpoints
+            "logging_steps": 25,
+            "save_steps": 100,
+            "save_total_limit": 2,
             "eval_strategy": "steps" if has_validation else "no",
             "eval_steps": 100 if has_validation else None,
-            "save_strategy": "steps", # Save based on steps
-            "load_best_model_at_end": has_validation, # Load best model only if validation set is used
+            "save_strategy": "steps",
+            "load_best_model_at_end": has_validation,
             "metric_for_best_model": "eval_loss" if has_validation else None,
-            "greater_is_better": False, # For loss, smaller is better
-            "save_safetensors": True, # Save model in safetensors format
-            "dataloader_num_workers": 0, # Force 0 workers for maximum compatibility and debugging multiprocessing
-            "dataloader_pin_memory": (DEVICE.type == "cuda" and not USE_CPU_ONLY), # Pin memory only if on GPU
-            "remove_unused_columns": True, # Clean up dataset columns not needed by the model
-            "seed": 42, # For reproducibility
-            "fp16": (DEVICE.type == "cuda" and not USE_CPU_ONLY), # Enable fp16 only for CUDA GPUs
-            "gradient_checkpointing": (DEVICE.type == "cuda" and not USE_CPU_ONLY), # Enable for memory saving on GPU
-            "optim": "adamw_torch", # Optimizer choice
-            "lr_scheduler_type": "cosine", # Learning rate scheduler
-            "report_to": "none", # Disable reporting to external services
-            "disable_tqdm": False, # Show progress bars
-            "log_level": "error",  # Suppress transformers internal logs in Trainer
+            "greater_is_better": False,
+            "save_safetensors": True,
+            "dataloader_num_workers": 0,
+            "dataloader_pin_memory": (DEVICE.type == "cuda" and not USE_CPU_ONLY),
+            "remove_unused_columns": True,
+            "seed": 42,
+            "fp16": (DEVICE.type == "cuda" and not USE_CPU_ONLY),
+            "gradient_checkpointing": (DEVICE.type == "cuda" and not USE_CPU_ONLY),
+            "optim": "adamw_torch",
+            "lr_scheduler_type": "cosine",
+            "report_to": "none",
+            "disable_tqdm": False,
+            "log_level": "error",
             "log_level_replica": "error",
-            "logging_nan_inf_filter": False, # Keep default
-            "log_on_each_node": False, # For distributed training, logs only on main node
+            "logging_nan_inf_filter": False,
+            "log_on_each_node": False,
         }
         
         default_args["use_cpu"] = USE_CPU_ONLY
@@ -1195,26 +1195,20 @@ def main():
     trainer = DeepSeekQwenTrainer(model_name="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
     
     try:
-        # Call the main training function with desired parameters
+        # Updated file paths to match data_formatter.py output
         result = trainer.train(
-            train_file="data_finetune/train.jsonl",
-            val_file=None, # Set to None to disable validation during training
+            train_file="data_finetune/dataset_train.jsonl",
+            val_file="data_finetune/dataset_validation.jsonl",
             output_dir="./DeepSeek-R1-Distill-Qwen-1.5B-finetuned",
             num_train_epochs=3,
-            # *** MODIFIED PARAMETERS FOR MEMORY REDUCTION ***
             per_device_train_batch_size=2,
             gradient_accumulation_steps=32,
-            # You could also try:
-            # max_length=256, # If your typical dialogue length is shorter
-            # ************************************************
             learning_rate=5e-5,
             weight_decay=0.01,
             warmup_steps=100,
             logging_steps=25,
             save_steps=100,
-            # Added for DataLoader worker seeding:
-            dataloader_num_workers=0, # Set to >0 if you want to use multiprocessing for data loading
-			#optim="adafactor"
+            dataloader_num_workers=0,
         )
         
         if result:
