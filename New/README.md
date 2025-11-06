@@ -96,8 +96,8 @@ python3 batch_embedder.py
 python3 data_formatter.py \
   --enable-semantic-labeling \
   --semantic-mode normal \
-  --semantic-method hybrid
-  --force-cpu (Forces it to use the CPU don't it uses GPU)
+  --semantic-method hybrid \
+  --force-cpu (optional)
 ```
 
 > Merges, cleans, and labels all sources.
