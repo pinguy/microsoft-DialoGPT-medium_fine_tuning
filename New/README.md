@@ -97,7 +97,7 @@ python3 data_formatter.py \
   --enable-semantic-labeling \
   --semantic-mode normal \
   --semantic-method hybrid
-  --force-cpu (Forces it to use the CPU otherwise uses GPU)
+  --force-cpu (Forces it to use the CPU don't it uses GPU)
 ```
 
 > Merges, cleans, and labels all sources.
