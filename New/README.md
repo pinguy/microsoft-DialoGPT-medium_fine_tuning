@@ -75,7 +75,7 @@ RhizomeML/
 ├── 🔧 Processing Scripts
 │   ├── pdf_to_json.py                 # PDF → structured JSON
 │   ├── batch_embedder.py              # Embed & index memory
-│   ├── batch_embedder.py            # Clean, dedupe, label, create datasets
+│   ├── data_formatter.py            # Clean, dedupe, label, create datasets
 │   └── train_script.py             # Fine-tune with theme tracking
 │
 ├── 📊 Generated Outputs
@@ -197,7 +197,7 @@ embedding_model = 'all-MiniLM-L12-v2'  # Or other ST models
 ### Step 3: Generate Training Dataset
 
 ```bash
-python3 batch_embedder.py \
+python3 data_formatter.py \
   --enable-semantic-labeling \
   --extract-keyphrases \
   --semantic-mode adaptive \
@@ -501,7 +501,7 @@ per_device_train_batch_size=1,      # Half the memory
 gradient_accumulation_steps=64,     # Maintain gradient quality
 
 # Or reduce sequence length
-# In batch_embedder.py:
+# In data_formatter.py:
 max_length=256,                     # Default is 512
 ```
 
@@ -531,12 +531,12 @@ gradient_accumulation_steps=64
 ```bash
 pip3 install keybert
 # Or disable keyphrases:
-python3 batch_embedder.py --enable-semantic-labeling  # (omit --extract-keyphrases)
+python3 data_formatter.py --enable-semantic-labeling  # (omit --extract-keyphrases)
 ```
 
 ### "Theme-weighted sampler created but all weights are identical"
 This means theme metadata is missing from your training data. Ensure:
-1. You ran `batch_embedder.py` with `--enable-semantic-labeling`
+1. You ran `data_formatter.py` with `--enable-semantic-labeling`
 2. `dataset_metadata.json` exists with theme distribution
 3. Training data includes `source_metadata.themes`
 
