@@ -114,7 +114,7 @@ python3 pdf_to_json.py ./PDFs/
 - Extracts text from PDFs with proper formatting
 - Chunks into semantically coherent segments
 - Preserves metadata (filename, page numbers, source type)
-- Outputs: `pdf_chunks.json` or similar
+- Outputs: `pdf_texts.json` or similar
 
 **Tips:**
 - Works best with text-based PDFs (not scanned images)
@@ -131,13 +131,13 @@ python3 pdf_to_json.py ./PDFs/
 3. Place in project root
 
 **From Claude:**
-1. Export conversations (format may vary)
+1. Export conversations
 2. Rename to `conversations2.json`
 3. Place alongside `conversations.json`
 
 **Supported formats:**
 - ChatGPT JSON exports
-- Claude conversation logs
+- Claude JSON exports
 - Custom JSON (see format below)
 
 <details>
@@ -241,7 +241,7 @@ data_finetune/
 ```
 
 **Semantic metadata includes:**
-- **4,744 unique themes** (your dataset)
+- **4,744 unique themes** (Example dataset)
 - Theme frequency distribution
 - Source breakdown (conversation vs PDF)
 - Quality score statistics
@@ -287,7 +287,7 @@ python3 train_script.py
 
 **What it does:**
 1. **Auto-detects hardware:** CPU or GPU (no changes needed)
-2. **Loads model:** DeepSeek-R1-Distill-Qwen-1.5B by default
+2. **Loads model:** DeepSeek-R1-Distill-Qwen-1.5B by default (But most HF models can be used as a drop in replacment).
 3. **Applies LoRA:** Efficient fine-tuning (9M trainable / 1.7B total params)
 4. **Enables theme weighting:** Rare themes get more training samples
 5. **Tracks diversity:** Monitors theme coverage during training
@@ -296,7 +296,7 @@ python3 train_script.py
 
 **Expected output:**
 ```
-🤖 DeepSeek-R1-Distill-Qwen-1.5B Fine-Tuning Suite v3.0
+🤖 DeepSeek-R1-Distill-Qwen-1.5B Fine-Tuning Suite
    🎨 Now with Semantic Theme-Aware Training!
 
 🔧 Model Setup
