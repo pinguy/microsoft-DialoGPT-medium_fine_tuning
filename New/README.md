@@ -156,5 +156,5 @@ DeepSeek-R1-Distill-Qwen-1.5B-finetuned_YYYYMMDD_HHMMSS/
 * The pipeline rewards **quality over quantity** — curate before you train.
 * **Keyphrase extraction** improves semantic richness but increases runtime; enable only for smaller datasets.
 * Training runs can take days on CPU — use screen/tmux and log output.
-* Included is gradio_chat_tts.py a TTS → TTS using [Vosk](https://alphacephei.com/vosk/models)) (will need to download one of the models and place into the root Dir) and [Kokoro](https://github.com/pinguy/kokoro-tts-addon)). Need to place the UCS_v3_4_1.py with it. At the moment Alpha stage but other interfaces are available.
+* Included is gradio_chat_tts.py a TTS → TTS using [Vosk](https://alphacephei.com/vosk/models)) (will need to download one of the models and place into the root Dir) and [Kokoro](https://github.com/pinguy/kokoro-tts-addon)). Will need to place the UCS_v3_4_1.py with the gradio_chat_tts.py. At the moment Alpha stage but other interfaces are available.
 ---
