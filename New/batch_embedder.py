@@ -479,57 +479,39 @@ class ImprovedBatchEmbedder:
                 logger.debug(f"Skipping malformed message {msg_id}: {e}")
     
     def _extract_message_content(self, message: dict) -> str:
-        """
-        Extract content from various message formats, including Claude's
-        format which has both 'text' and 'content' fields.
-        """
+        """Extract content from various message formats"""
         if not isinstance(message, dict):
             return ""
         
-        extracted_parts = []
+        # Prioritize 'text' field, then 'content'
+        content = message.get("text") or message.get("content") or message.get("message")
         
-        # 1. Get the top-level 'text' field (common in Claude format)
-        top_level_text = message.get("text")
-        if isinstance(top_level_text, str) and top_level_text.strip():
-            extracted_parts.append(top_level_text.strip())
-        
-        # 2. Get the 'content' field (common in Claude and ChatGPT)
-        #    Also check 'message' as a fallback
-        content_field = message.get("content") or message.get("message")
-        
-        if isinstance(content_field, str):
-            # Simple string content
-            if content_field.strip():
-                extracted_parts.append(content_field.strip())
-        
-        elif isinstance(content_field, dict):
-            # Handle nested content structures like {"parts": ["text"]} (ChatGPT)
-            if "parts" in content_field and isinstance(content_field["parts"], list):
-                parts = content_field["parts"]
+        if isinstance(content, str):
+            return content.strip()
+        elif isinstance(content, dict):
+            # Handle nested content structures like {"parts": ["text"]} or {"text": "..."}
+            if "parts" in content and isinstance(content["parts"], list):
+                parts = content["parts"]
                 if parts and isinstance(parts[0], str):
-                    extracted_parts.append(parts[0].strip())
-            # Handle {"text": "..."}
-            elif "text" in content_field and isinstance(content_field["text"], str):
-                extracted_parts.append(content_field["text"].strip())
+                    return parts[0].strip()
+            elif "text" in content:
+                return str(content["text"]).strip()
+        elif isinstance(content, list):
+            # Handle content as array (e.g., list of strings or list of content objects)
+            if content:
+                # Try to join string parts if it's a list of strings
+                if all(isinstance(item, str) for item in content):
+                    return " ".join(item.strip() for item in content).strip() # Ensure stripping each part
+                # If it's a list of dictionaries, try to extract text from each
+                elif all(isinstance(item, dict) for item in content):
+                    extracted_parts = []
+                    for item in content:
+                        part_text = item.get("text") or item.get("content")
+                        if isinstance(part_text, str):
+                            extracted_parts.append(part_text.strip()) # Ensure stripping each part
+                    return " ".join(extracted_parts).strip()
         
-        elif isinstance(content_field, list):
-            # Handle content as array
-            # (e.g., list of strings or list of content objects)
-            for item in content_field:
-                if isinstance(item, str):
-                    if item.strip():
-                        extracted_parts.append(item.strip())
-                elif isinstance(item, dict):
-                    # Check for "text" or "content" inside the dict
-                    # (Covers Claude's {"type": "text", "text": "..."})
-                    part_text = item.get("text") or item.get("content")
-                    if isinstance(part_text, str) and part_text.strip():
-                        extracted_parts.append(part_text.strip())
-        
-        # 3. Deduplicate and join
-        #    Use a dict to maintain order and remove exact duplicates
-        unique_parts = list(dict.fromkeys(extracted_parts))
-        return " ".join(unique_parts).strip()
+        return ""
     
     def _extract_author(self, message: dict) -> str:
         """Extract author/role from various message formats"""
@@ -890,22 +872,10 @@ class ImprovedBatchEmbedder:
                                 first_chat_message = first_item['chat_messages'][0]
                                 logger.info(f"    - First chat_message keys: {list(first_chat_message.keys())}")
                                 logger.info(f"    - First chat_message sender: {first_chat_message.get('sender')}")
-                                logger.info(f"    - First chat_message (top-level) text snippet: '{first_chat_message.get('text', '')[:50]}...'")
-                                
-                                # Add new diagnostics for 'content' array
-                                content_list = first_chat_message.get('content')
-                                if isinstance(content_list, list) and len(content_list) > 0:
-                                    first_content_item = content_list[0]
-                                    if isinstance(first_content_item, dict):
-                                        logger.info(f"    - First chat_message content[0] keys: {list(first_content_item.keys())}")
-                                        logger.info(f"    - First chat_message content[0] type: {first_content_item.get('type')}")
-                                        logger.info(f"    - First chat_message content[0] text snippet: '{first_content_item.get('text', '')[:50]}...'")
-                                    else:
-                                        logger.info(f"    - First chat_message content[0] is not a dict (type: {type(first_content_item)})")
-                                elif isinstance(content_list, list):
-                                     logger.info("    - First chat_message 'content' list is empty.")
-                                else:
-                                     logger.info("    - First chat_message 'content' field is not a list or is missing.")
+                                logger.info(f"    - First chat_message text snippet: '{first_chat_message.get('text', '')[:50]}...'")
+                                if isinstance(first_chat_message.get('content'), list) and len(first_chat_message['content']) > 0:
+                                    logger.info(f"    - First chat_message content[0] keys: {list(first_chat_message['content'][0].keys())}")
+                                    logger.info(f"    - First chat_message content[0] text snippet: '{first_chat_message['content'][0].get('text', '')[:50]}...'")
                             else:
                                 logger.info("  - 'chat_messages' list is empty in the first conversation object.")
                         elif 'mapping' in first_item:
@@ -925,18 +895,13 @@ class ImprovedBatchEmbedder:
                                 logger.info(f"    - First message in 'messages' keys: {list(first_item['messages'][0].keys())}")
                                 author_role = first_item['messages'][0].get('role', 'N/A')
                                 logger.info(f"    - Example author role: '{author_role}'")
-                        elif 'sender' in first_item and ('text' in first_item or 'content' in first_item):
+                        elif 'sender' in first_item and 'text' in first_item and 'content' in first_item:
                             logger.info("  - Appears to be a direct list of message objects (e.g., simple chat export).")
                             logger.info(f"    - First message sender: {first_item.get('sender')}")
                             logger.info(f"    - First message text snippet: '{first_item.get('text', '')[:50]}...'")
-                            content_list = first_item.get('content')
-                            if isinstance(content_list, list) and len(content_list) > 0:
-                                first_content_item = content_list[0]
-                                if isinstance(first_content_item, dict):
-                                    logger.info(f"    - First message content[0] keys: {list(first_content_item.keys())}")
-                                    logger.info(f"    - First message content[0] text snippet: '{first_content_item.get('text', '')[:50]}...'")
-                                else:
-                                    logger.info(f"    - First message content[0] is not a dict (type: {type(first_content_item)})")
+                            if isinstance(first_item.get('content'), list) and len(first_item['content']) > 0:
+                                logger.info(f"    - First message content[0] keys: {list(first_item['content'][0].keys())}")
+                                logger.info(f"    - First message content[0] text snippet: '{first_item['content'][0].get('text', '')[:50]}...'")
                         else:
                             logger.info("  - Does NOT appear to be a recognized conversation format at the top level.")
                             logger.info(f"    - First item structure: {json.dumps(first_item, indent=2)[:500]}...") # Print more of the structure
