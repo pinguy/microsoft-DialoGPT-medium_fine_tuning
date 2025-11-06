@@ -12,7 +12,7 @@
 **GPU:** Optional (Compute Capability ≥ 6.0)  
 **Reality check:** Runs on decade-old Xeons. Patience required.
 
-To reduce memory use, tweak these inside `train_script_v2.py`:
+To reduce memory use, tweak these inside `train_script.py`:
 
 * `per_device_train_batch_size`
 * `gradient_accumulation_steps`
@@ -39,7 +39,7 @@ python3 -m spacy download en_core_web_sm
 ## 📂 Folder Structure
 
 ```
-AI_Fine_Tuning_Pipeline/
+RhizomeML/
 ├── PDFs/                     # Optional raw PDFs
 ├── data_finetune/            # Auto-generated clean datasets
 ├── DeepSeek-R1-Distill-Qwen-1.5B-finetuned_*  # Output checkpoints
@@ -47,7 +47,7 @@ AI_Fine_Tuning_Pipeline/
 ├── pdf_to_json.py            # Converts PDFs → structured JSON
 ├── batch_embedder.py         # Embeds and indexes semantic memory
 ├── data_formatter.py         # Cleans, dedups, and labels data
-├── train_script_v2.py        # Fine-tunes models (CPU-optimized)
+├── train_script.py        # Fine-tunes models (CPU-optimized)
 ├── requirements.txt
 └── README.md
 ```
@@ -77,7 +77,7 @@ conversations2.json     # Claude (optional)
 
 ---
 
-### 3️⃣ Embed & Index Semantic Memory
+### 3️⃣ Embed & Index Semantic Memory (uses CPU by default but can change use_gpu=False to True for GPU)
 
 ```
 python3 batch_embedder.py
@@ -95,8 +95,9 @@ python3 batch_embedder.py
 ```
 python3 data_formatter.py \
   --enable-semantic-labeling \
-  --semantic-mode adaptive \
+  --semantic-mode normal \
   --semantic-method hybrid
+  --force-cpu (Forces it to use the CPU otherwise uses GPU)
 ```
 
 > Merges, cleans, and labels all sources.
@@ -105,13 +106,14 @@ python3 data_formatter.py \
 > * `dataset_train.jsonl`
 > * `dataset_validation.jsonl`
 > * `dataset_test.jsonl`
+> * `dataset_metadata.json`
 
 ---
 
 ### 5️⃣ Train the Model (LoRA Fine-Tune)
 
 ```
-python3 train_script_v2.py
+python3 train_script.py
 ```
 
 > Fine-tunes **DeepSeek-R1-Distill-Qwen-1.5B** (or other compatible models).
@@ -121,18 +123,6 @@ Outputs go into:
 
 ```
 DeepSeek-R1-Distill-Qwen-1.5B-finetuned_YYYYMMDD_HHMMSS/
-```
-
----
-
-### 6️⃣ Interact with Semantic Memory (Optional)
-
-Once embeddings exist, you can query them programmatically for recall or analysis.
-
-```
-from batch_embedder import SemanticMemory
-mem = SemanticMemory.load("memory_metadata.pkl")
-mem.query("What did Hofstadter say about recursion?")
 ```
 
 ---
@@ -166,28 +156,5 @@ mem.query("What did Hofstadter say about recursion?")
 * The pipeline rewards **quality over quantity** — curate before you train.
 * **Keyphrase extraction** improves semantic richness but increases runtime; enable only for smaller datasets.
 * Training runs can take days on CPU — use screen/tmux and log output.
-
----
-
-## 🗺️ Roadmap
-
-* [ ] CLI interface for model/dataset selection
-* [ ] CPU benchmark harness
-* [ ] Optional web dashboard for live training metrics
-* [ ] Semantic theme visualization tools
-
----
-
-## 📄 License
-
-This project is licensed under the **WTFPL – Do What the Fuck You Want to Public License.**
-See [wtfpl.net](http://www.wtfpl.net/) for details.
-
----
-
-## 🌿 Origin Story
-
-Born out of curiosity (and a stubborn Xeon workstation), **RhizomeML** carries the same spirit as the old *Pinguy OS* project —
-making complex systems usable, elegant, and entirely under your own control.
-
+* Included is gradio_chat_tts.py a TTS → TTS using [Vosk](https://alphacephei.com/vosk/models)) (will need to download one of the models and place into the root Dir) and [Kokoro](https://github.com/pinguy/kokoro-tts-addon)). Need to place the UCS_v3_4_1.py with it. At the moment Alpha stage but other interfaces are available.
 ---
